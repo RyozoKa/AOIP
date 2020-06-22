@@ -1,0 +1,102 @@
+#pragma once
+
+#if defined WIN32
+#include <winsock2.h>
+#include <WS2tcpip.h>
+#else
+#define closesocket close
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
+#endif 
+
+#ifdef EXPORT
+#define AOIP_API __declspec(dllexport)
+#else
+#define AOIP_API __declspec(dllimport)
+#endif
+
+#ifdef WIN32
+
+#define PACKED
+#pragma pack(push, 4)
+
+//#else
+//#define PACKED __attribute__ ((__packed__))
+#endif
+
+//Streams can either be added or replaced (reconnect)
+//The only way to differentiate them is by their channel blocks.
+//We want an efficient way to check that. Using hashes isn't ideal because we can have anything from 1 to 128 channels from a single device and stream.
+//For now, we'll just use a byte array and test
+
+struct DEVICE
+{
+	char* DevName;
+	unsigned int IP;
+	unsigned char Channels;			//Number of channels streamed by this device
+	unsigned char ChannelOffset;	//Starting offset for device channels e.g Channeloffset = 32, Channels = 32 resulting in channels 32 to 64 in the absolute range. Relative ranges are held in the Streams
+};
+
+
+
+struct Interface
+{
+	char *Name;	//Hardware name
+	char* Description;	//Readable Name
+	unsigned int IP;	//Local interface IP
+	unsigned char MAC[16];
+	void* Handle;	//Internal
+};
+
+#define MAXSAMPLES 384 //Max number of total samples per packet @24 bits
+#define FRAMESIZE 54
+#define UDPPAYLOAD 42
+
+#ifdef WIN32
+#pragma pack(pop)
+#undef PACKED
+
+#else
+#undef PACKED
+#endif
+
+typedef void(*timer)(unsigned char Channels);
+
+
+#define VALIDINTERFACE(x) x->Handle
+
+extern AOIP_API unsigned char DevIndex;
+extern AOIP_API DEVICE Devices[128];
+extern AOIP_API unsigned short ChannelCount;
+//extern AOIP_API SDP TransmissionStreams[32];
+extern AOIP_API unsigned char NumTStreams;
+
+AOIP_API Interface* GetInterfaces();
+
+
+//
+//// Initializer functions, needs to be called in the order of declaration as seen below.
+//
+AOIP_API void InitializeIf(Interface*);
+AOIP_API void InitializeSAP(const char* IP);
+//It's crucial that the SampleDelay is some multiple of 16
+AOIP_API void InitializeEngine(double _IntervalFreq, timer _Callback, unsigned char SampleDelay, float *RecvBuffer /* at least 16*128*3 bytes in size */);
+
+AOIP_API void SetDeviceName(const char*);
+AOIP_API void CreateNewStream(const char* StreamName, unsigned char ChannelOffset, unsigned char NumChannels, unsigned char NumSamples, unsigned int SampleRate);
+//
+//// Control flow functions
+//
+AOIP_API void BeginSAP();
+AOIP_API void EndSAP();
+AOIP_API void BeginSAPTransmission();
+AOIP_API void EndSAPTransmission();
+
+AOIP_API void BeginRTPRecv();
+AOIP_API void EndRTPRecv();
+
+AOIP_API void SetIPPrefix(unsigned char);
+
+AOIP_API unsigned char* GetTxBuffer(unsigned char Index);

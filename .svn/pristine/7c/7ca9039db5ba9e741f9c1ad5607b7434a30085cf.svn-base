@@ -1,0 +1,2148 @@
+﻿// AOIP.cpp : Defines the exported functions for the DLL application.
+//
+
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+
+#include "AOIP.h"
+#include <stdio.h>
+#include <intrin.h>
+#include <powerbase.h>
+#include <powrprof.h>
+#include <assert.h>
+#include <thread>
+#include <iostream>
+#include <iphlpapi.h>
+#include "pcap.h"
+#include <atomic>
+#include <string>
+//Packet offset for RTP header
+#define RTPOFFSET 42
+#define PAYLOADOFFSET 54
+#define RTPTSOFFSET 46
+
+//Declarations
+NTSTATUS
+WINAPI
+CallNtPowerInformation(
+	_In_ POWER_INFORMATION_LEVEL InformationLevel,
+	_In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
+	_In_ ULONG InputBufferLength,
+	_Out_writes_bytes_opt_(OutputBufferLength) PVOID OutputBuffer,
+	_In_ ULONG OutputBufferLength
+);
+
+
+unsigned long long GetQPC()
+{
+	LARGE_INTEGER cnt;
+	QueryPerformanceCounter((LARGE_INTEGER*)&cnt);
+	return cnt.QuadPart;
+}
+
+unsigned long long rdtsc()	//Function stub
+{
+	return __rdtsc();
+}
+
+unsigned long StringToIP(const char* IP)	//IPv4 only
+{
+	union
+	{
+		unsigned char Bytes[4];
+		unsigned long Data;
+	};
+	unsigned char Index = 0;
+	while (Index < 4)
+	{
+		if (IP[1] == '.' || IP[1] == 0)	//X.
+		{
+			Bytes[Index] = IP[0] - '0';
+			IP += 2;
+		}
+		else if (IP[2] == '.' || IP[2] == 0)
+		{
+			Bytes[Index] = ((IP[0] - '0') * 10) + (IP[1] - '0');
+			IP += 3;
+		}
+		else if (IP[3] == '.' || IP[3] == 0)
+		{
+			Bytes[Index] = ((IP[0] - '0') * 100) + ((IP[1] - '0') * 10) + (IP[2] - '0');
+			IP += 4;
+		}
+		else return 0;
+		++Index;
+	}
+	return Data;
+}
+//Fast String to number converter and pow10
+unsigned long long StaticPow10(BYTE num)
+{
+	static UINT64 pow10s[19] = {
+	1,
+	10,
+	100,
+	1000,
+	10000,
+	100000,
+	1000000,
+	10000000,
+	100000000,
+	1000000000,
+	10000000000,
+	100000000000,
+	1000000000000,
+	10000000000000,
+	100000000000000,
+	1000000000000000,
+	10000000000000000,
+	100000000000000000,
+	1000000000000000000
+	};
+	return pow10s[num];
+}
+
+signed long long ToNum(char *st)
+{
+	bool bNeg = false;
+	INT64 num = 0;
+	if (*st == '-')
+	{
+		bNeg = true;
+		++st;
+	}
+	size_t len = strlen(st);
+	for (int i = len - 1; i >= 0; --i)
+	{
+		num += StaticPow10(i) * (*st - '0');
+		++st;
+	}
+	if (bNeg)
+		num = ~num + 1;
+	return num;
+}
+
+//Control signals
+std::thread SAPThread;
+std::thread RTPThread;
+std::thread PollThread;
+bool bSAPTrans = false;	//Don't transmit SAP by default
+bool bSAPMain = false;
+bool bRTPMain = false;
+bool bRTPTrans = false;
+bool bRTPCB = true;
+
+double IntervalFreq;
+
+SOCKET SAPSocket;
+SOCKADDR_IN SAPAddr;
+SOCKADDR_IN SAPInAddr;
+
+unsigned long SAPIPAddr;
+pcap_t *listener;
+unsigned char SampleDelay;
+
+SDP Streams[128];
+AOIP_API SDP TransmissionStreams[32];
+AOIP_API unsigned char NumTStreams = 0;
+
+//Channel ring buffer
+__declspec(align(32)) float ChannelData[128][1024];
+AOIP_API DEVICE Devices[128];	//Change this later
+AOIP_API unsigned char DevIndex = 0;
+std::atomic<unsigned short> GStepperIndex = 0;
+AOIP_API unsigned short ChannelCount = 0;
+float *OutBuffer;
+unsigned char Index = 0;
+unsigned char NumDevs = 0;	//Stream counter, Index does not necessarily represent the number of connected devices once a device is disconnected.
+Interface* SelectedInterface;
+timer Timer;
+char PCErr[PCAP_ERRBUF_SIZE];
+const char* DevName;
+
+unsigned char IPPrefix = 69;	//Default dante prefix
+bool bUpdateTS = true;
+
+unsigned long long (*GetTS)(void);
+
+double PTPTimeStamp;
+double Start;
+
+unsigned long long GetTSFreq()
+{
+	unsigned long long Res;
+	int cpuInfo[4] = { 0, 0, 0, 0 };
+	__cpuid(cpuInfo, 0);
+	/*if (cpuInfo[0] >= 0x16)
+	{
+		__cpuid(cpuInfo, 0x16);
+		Res = ((unsigned long long)cpuInfo[0]) * 1000000;
+		GetTS = &rdtsc;
+	}
+	else*/
+	{
+
+		GetTS = &GetQPC;
+		QueryPerformanceFrequency((LARGE_INTEGER*)&Res);
+		//This is a risky swamp, because CPUs with turbo boost enabled that doesn't have an invariant clock will cause the timer to run faster.
+		//We need to resort to HPET timers in such cases, rather than rdtsc.
+	}
+	return Res;
+}
+
+unsigned long long TSFreq = GetTSFreq();
+unsigned long long LocalTS;
+unsigned char		PTPMasterClock[8];	//XX-XX-XX-FF-FE-XX-XX-XX
+
+//Forward declarations
+void SAPListener();
+void MainLoop();
+void PollLoop();
+
+
+unsigned int GenerateIP()
+{
+	srand(__rdtsc() & ~0x0ul);
+	//return (rand() & 0xFF) << 24 | (rand() & 0xFF) << 16 | (IPPrefix) << 8 | 239;
+	return (1) << 24 | (0) << 16 | (69) << 8 | 239;
+}
+
+/*
+	Sending packets needs to be done synchronized with the timer, and we want to do this as fast as possible
+	Implementing an extra delay is going to cause complications for the transmission because it needs to be "snapped"
+	to a frame.
+	The easiest way to do this is therefore a second ringbuffer
+*/
+
+//Faster than a log10, used to add fraction to a float or double.
+void numDigits(UINT64 number, UINT64 *OutCnt, UINT64 *OutFactor)
+{
+	if (number < 10)
+	{
+		*OutCnt = 1;
+		*OutFactor = 1;
+	}
+	else if (number < 100)
+	{
+		*OutCnt = 2;
+		*OutFactor = 10;
+	}
+	else if (number < 1000)
+	{
+		*OutCnt = 3;
+		*OutFactor = 100;
+	}
+	else if (number < 10000)
+	{
+		*OutCnt = 4;
+		*OutFactor = 1000;
+	}
+	else if (number < 100000)
+	{
+		*OutCnt = 5;
+		*OutFactor = 10000;
+	}
+	else if (number < 1000000)
+	{
+		*OutCnt = 6;
+		*OutFactor = 100000;
+	}
+	else if (number < 10000000)
+	{
+		*OutCnt = 7;
+		*OutFactor = 1000000;
+	}
+	else if (number < 100000000)
+	{
+		*OutCnt = 8;
+		*OutFactor = 10000000;
+	}
+	else if (number < 1000000000)
+	{
+		*OutCnt = 9;
+		*OutFactor = 100000000;
+	}
+	else if (number < 10000000000)
+	{
+		*OutCnt = 10;
+		*OutFactor = 1000000000;
+	}
+	else if (number < 100000000000)
+	{
+		*OutCnt = 11;
+		*OutFactor = 10000000000;
+	}
+	else if (number < 1000000000000)
+	{
+		*OutCnt = 12;
+		*OutFactor = 100000000000;
+	}
+	else if (number < 10000000000000)
+	{
+		*OutCnt = 13;
+		*OutFactor = 1000000000000;
+	}
+	else if (number < 100000000000000)
+	{
+		*OutCnt = 14;
+		*OutFactor = 10000000000000;
+	}
+	else if (number < 1000000000000000)
+	{
+		*OutCnt = 15;
+		*OutFactor = 100000000000000;
+	}
+	else if (number < 10000000000000000)
+	{
+		*OutCnt = 16;
+		*OutFactor = 1000000000000000;
+	}
+	else if (number < 100000000000000000)
+	{
+		*OutCnt = 17;
+		*OutFactor = 10000000000000000;
+	}
+	else if (number < 1000000000000000000)
+	{
+		*OutCnt = 18;
+		*OutFactor = 100000000000000000;
+	}
+	else
+	{
+		*OutCnt = 19;
+		*OutFactor = 1000000000000000000;
+	}
+}
+
+
+AOIP_API void SetDeviceName(const char* Dev)
+{
+	DevName = Dev;
+}
+
+void DecodeSession(SDP& Meta)
+{
+	Meta.SDPData = Meta.Raw + sizeof(SAP);
+	char* Data = Meta.SDPData;
+	Meta.SAPHeader = (SAP*) Meta.Raw;
+
+	assert(*Data == 'v');
+
+	char* Attr;
+
+	while (*Data)
+	{
+		if (*((unsigned short*)Data) == 0x3d6f) //UTF-8 "=o"
+		{
+			Data += 2; // '='
+
+			//Skip Owner
+			while (*Data != 0x20)
+				++Data;
+			++Data;
+
+			//Skip session ID
+			while (*Data != 0x20)
+				++Data;
+			++Data;
+
+			//Skip session Version
+			while (*Data != 0x20)
+				++Data;
+			++Data;
+
+			Data += 7; //Skip "IN IP4 " !!!Warning: Only compatible with AES67
+
+			Attr = Data;
+			//End of chunk, delimited by 0x0a0d
+			while (*((unsigned short*)Data) != 0x0a0d)
+				++Data;
+			*Data = 0;
+			Data += 2;
+			Meta.TransmitterIP = StringToIP(Attr);
+
+		}
+		if (*((unsigned short*)Data) == 0x3d73) //Faster Checks, Stream and test both bytes at once.//(*Data == 's' && *(++Data) == '=')	//Get Session name as device name "s="
+		{
+			Data += 2;
+
+			Meta.DevName = Data;
+			while (*((unsigned short*)Data) != 0x0a0d)
+				++Data;
+			*Data = 0;
+			++Data;
+		}
+		if (*((unsigned short*)Data) == 0x3d63)
+		{
+			Data += 9;
+			Attr = Data;
+			while (*Data != 0x2f)
+				++Data;
+			*Data = 0;
+
+			Meta.MultigroupIP = StringToIP(Attr);
+			while (*((unsigned short*)Data) != 0x0a0d)
+				++Data;
+
+			Data += 2;
+		}
+		if (*((unsigned short*)Data) == 0x3d6d) //UTF-8 "m="
+		{
+			while (*Data != 0x20)
+				++Data;
+			++Data;
+
+			Attr = Data;
+
+			while (*Data != 0x20)
+				++Data;
+			*Data = 0;
+
+			Meta.TransmitterPort = ToNum(Attr);
+
+			while (*((unsigned short*)Data) != 0x0a0d) //Skip the checks in the mainloop for faster iteration.
+				++Data;
+			Data += 2;
+		}
+		if (*((unsigned short*)Data) == 0x3d69)	//i=
+		{
+			Data += 2;
+			while (*Data != 0x20)
+				++Data;
+			++Data;
+			Data += 10; //"Channels: "
+			Attr = Data;
+			while (*Data != 0x2C && *((unsigned short*)Data) != 0x0a0d)
+				++Data;
+			*Data = 0;
+			//Assign numbers to literate channels
+			if (*Attr == 'L' || *Attr == 'R')
+				Meta.ChannelOffset = 0;
+			else
+				Meta.ChannelOffset = ToNum(Attr) - 1;
+		}
+		if (*((unsigned int*)Data) == 0x74723d61)	//"a=rt" for rtpmap. This is completely safe as long as we're on the stack, or we're not outside the 1k buffer
+		{
+			//RTPMap:97
+			while (*Data != 0x20)
+				++Data;
+			++Data;
+
+
+			//MIME Type
+			++Data;
+			Attr = Data;
+			while (*Data != 0x2f)
+				++Data;
+			*Data = 0;
+			Meta.ByteDepth = ToNum(Attr) / 8;
+			++Data;
+
+			Attr = Data;
+
+			//Sample rate
+			while (*Data != 0x2f)
+				++Data;
+			*Data = 0;
+			Meta.SampleRate = ToNum(Attr);
+			Meta.PackSamples = 0;	//We don't know this yet
+			++Data;
+			//Channels
+			Attr = Data;
+			while (*((unsigned short*)Data) != 0x0a0d)
+				++Data;
+			*Data = 0;
+			Meta.Channels = ToNum(Attr);
+
+			Data += 2;
+		}
+		++Data;
+	}
+}
+
+struct
+{
+	SAP SAPData;
+	char SDPBroadcast[300];	//This will be broadcasted for other devices to hear
+} SDPTemplate;
+
+
+AOIP_API void InitializeSAP(const char *IP)
+{
+	SAPIPAddr = StringToIP(IP);
+}
+
+void SAPListener()
+{
+	SetThreadAffinityMask(GetCurrentThread(), 1);	//Core #1
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
+		printf("Server: WSAStartup failed for SAP with error %ld\n", WSAGetLastError());
+		exit(-1);
+	}
+
+	SAPSocket = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (SAPSocket == INVALID_SOCKET)
+	{
+		printf("Server read: Error at SAP socket() : %ld\n", WSAGetLastError());
+		// Close the socket
+		closesocket(SAPSocket);
+
+		// Clean up
+		WSACleanup();
+
+		exit(-1);
+	}
+
+	SAPAddr.sin_addr.S_un.S_addr = 0;
+	SAPAddr.sin_family = AF_INET;
+	SAPAddr.sin_port = htons(9875);
+	bool T = true;
+
+	//Make sure that other applications can use this port too if they wish.
+	if(setsockopt(SAPSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&T, sizeof(bool)) < 0)
+	{
+		printf("Server read: setsockopt() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(SAPSocket);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+
+	//Make it non-blocking. EDIT: We're keeping it in a separate thread
+	//unsigned long iMode = 1;
+	//ioctlsocket(SAPSocket, FIONBIO, &iMode);
+
+	if (bind(SAPSocket, (SOCKADDR*)&SAPAddr, sizeof(SOCKADDR_IN)) == SOCKET_ERROR)
+	{
+		printf("Server read: bind() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(SAPSocket);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+
+	struct ip_mreq mreq;
+	memset(&mreq, 0, sizeof(ip_mreq));
+	mreq.imr_multiaddr.s_addr = SAPIPAddr;
+	mreq.imr_interface.s_addr = 0;// StringToIP("192.168.15.98");
+	if (setsockopt(SAPSocket, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0)
+	{
+		printf("Server read: setsockopt() add membership failed! Error : %ld. IP %lu\n", WSAGetLastError(), mreq.imr_multiaddr.s_addr);
+		// Close the socket
+		closesocket(SAPSocket);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+	setsockopt(SAPSocket, IPPROTO_IP, IP_MULTICAST_IF, (char*)&mreq.imr_interface, sizeof(SOCKADDR_IN));
+
+#ifdef WIN32
+	DWORD timeout = 0;
+	setsockopt(SAPSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof timeout);
+#else
+
+#endif
+
+	//disable loopback
+	//u_char loop = 0;
+	//setsockopt(SAPSocket, IPPROTO_IP, IP_MULTICAST_LOOP, (char*)&loop, sizeof(loop));
+	
+	unsigned long iMode = 1;
+	unsigned char i = 0;
+	printf("Listening for SAP data\n");
+	//The same device will be able to send a number of different SAP packets, one for each stream.
+	while (true)
+	{
+		//Fetch a new device block, this is a very fast way of avoiding any cross-thread locks
+		SDP &Stream = Streams[Index];
+
+		Stream.Timestamp = 0;
+		//Start listening for SAP packets
+		int Bytes = recv(SAPSocket, Stream.Raw, 1024,0);
+
+
+		if (Bytes < 1)
+			continue;
+		//We start by moving the data to an empty device, then check if the device already exists, if it does, then swap them, make sure that the device is invalid first, otherwise just discard the packet.
+
+		Stream.Raw[Bytes] = 0;
+		//Process
+
+		//Decode SDP block
+		DecodeSession(Stream);
+
+		//Don't add ourselves.
+		if (!strncmp(Stream.DevName, "Host", 4) && Stream.TransmitterIP == SelectedInterface->IP)
+			goto END;
+
+		//Check if the stream already exists
+		for (int i = 0; i < Index; ++i)
+		{
+			if (Streams[i].TransmitterIP == Stream.TransmitterIP && Streams[i].MultigroupIP == Stream.MultigroupIP)
+				goto END;
+		}
+
+		//Add device and channel count.
+		for (i = 0; i < DevIndex; ++i)
+		{
+			if (!strcmp(Devices[i].DevName, Stream.DevName))
+			{
+				//Check if channel chunk exists
+				//We're assuming that the channels are always assigned in a sequential fashion.
+				
+				if (Devices[i].Channels < ( Stream.ChannelOffset + Stream.Channels ))
+				{
+					unsigned char Delta = (Stream.ChannelOffset + Stream.Channels) - Devices[i].Channels;
+					if (Devices[i].ChannelOffset + Stream.ChannelOffset + Stream.Channels > 128)
+					{
+						printf("Warning: Cannot add Stream for device %s, the limit of 128 devices has been reached. Ch offset %u, Channels %u\n", Stream.DevName, Stream.ChannelOffset, Stream.Channels);
+						goto END;
+					}
+					Devices[i].Channels = Stream.ChannelOffset + Stream.Channels;
+					ChannelCount += Delta;// (Stream.ChannelOffset + Stream.Channels - Delta);
+				}
+				Devices[i].IP = Stream.TransmitterIP;
+				Stream.Device = &Devices[i];
+				printf("Sucessfully added stream %u for device %s \n", Stream.MultigroupIP, Stream.DevName);
+				break;//Very important!
+			}
+		}
+		if(i == DevIndex)	//Not found, add new device
+		{
+			Devices[DevIndex].DevName = Stream.DevName;
+			Devices[DevIndex].Channels = Stream.ChannelOffset + Stream.Channels;
+			Devices[DevIndex].IP = Stream.TransmitterIP;
+			Devices[DevIndex].ChannelOffset = Devices[DevIndex - 1].ChannelOffset + Devices[DevIndex - 1].Channels;
+			if (Devices[DevIndex].ChannelOffset + Devices[DevIndex].Channels > 128)
+			{
+				printf("Warning: Cannot add Device %s, the limit of 128 devices has been reached.\n", Stream.DevName);
+				goto END;
+			}
+			Stream.Device = &Devices[DevIndex];
+			++DevIndex;
+			ChannelCount += Stream.ChannelOffset + Stream.Channels;
+			printf("Sucessfully added stream %u for device %s\n", Stream.MultigroupIP, Stream.DevName);
+		}
+		
+		//We're using it, so create the socket for it
+		/*Stream.DevSock = socket(AF_INET, SOCK_DGRAM, 0);
+		if (Stream.DevSock == INVALID_SOCKET)
+		{
+			printf("SAP Engine: failed to create socket for stream %u at device %s reason : %ld\n", Stream.MultigroupIP, Stream.DevName, WSAGetLastError());
+			// Close the socket
+			closesocket(SAPSocket);
+
+			// Clean up
+			WSACleanup();
+
+			exit(-1);
+		}
+
+		Stream.DevAddr.sin_addr.s_addr = 0;
+		Stream.DevAddr.sin_family = AF_INET;
+		Stream.DevAddr.sin_port = htons(Stream.TransmitterPort);
+		
+		if (setsockopt(Stream.DevSock, SOL_SOCKET, SO_REUSEADDR, (char*)&T, sizeof(bool)) < 0)
+		{
+			printf("SAP Engine: setsockopt() failed! Error : %ld.\n", WSAGetLastError());
+			// Close the socket
+			closesocket(Stream.DevSock);
+
+			// Do the clean up
+			WSACleanup();
+
+			// and exit with error
+			exit(-1);
+		}
+
+		//Bind it to the correct port
+		if (bind(Stream.DevSock, (SOCKADDR*)&Stream.DevAddr, sizeof(SOCKADDR_IN)) == SOCKET_ERROR)
+		{
+			printf("SAP Engine: failed to bind socket to port %u for stream %u at device %s reason : %ld\n", Stream.TransmitterPort, Stream.MultigroupIP, Stream.DevName, WSAGetLastError());
+			// Close the socket
+			closesocket(Stream.DevSock);
+
+			// Do the clean up
+			WSACleanup();
+
+			// and exit with error
+			exit(-1);
+		}
+
+		//Join multigroup
+		struct ip_mreq mreq;
+		memset(&mreq, 0, sizeof(ip_mreq));
+		mreq.imr_multiaddr.s_addr = Stream.MultigroupIP;
+		mreq.imr_interface.s_addr = 0;// StringToIP("192.168.15.98");
+		if (setsockopt(Stream.DevSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0)
+		{
+			printf("SAP Engine: failed to join multigroup %u.%u.%u.%u for stream %u at device %s reason : %ld\n", ((unsigned char*)&Stream.MultigroupIP)[0], ((unsigned char*)&Stream.MultigroupIP)[1], ((unsigned char*)&Stream.MultigroupIP)[2], ((unsigned char*)&Stream.MultigroupIP)[3], Stream.MultigroupIP, Stream.DevName, WSAGetLastError());
+			// Close the socket
+			closesocket(Stream.DevSock);
+
+			// Do the clean up
+			WSACleanup();
+
+			// and exit with error
+			exit(-1);
+		}
+		//Set the stream non-blocking
+		ioctlsocket(Stream.DevSock, FIONBIO, &iMode);
+		*/
+		//Currently this is the only way Windows allows us to 
+		struct ip_mreq mreq;
+		memset(&mreq, 0, sizeof(ip_mreq));
+		mreq.imr_multiaddr.s_addr = Stream.MultigroupIP;
+		mreq.imr_interface.s_addr = 0;// StringToIP("192.168.15.98");
+		if (setsockopt(socket(AF_INET, SOCK_DGRAM, 0), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0)
+		{
+			printf("SAP Engine: failed to join multigroup %u.%u.%u.%u for stream %u at device %s reason : %ld\n", ((unsigned char*)&Stream.MultigroupIP)[0], ((unsigned char*)&Stream.MultigroupIP)[1], ((unsigned char*)&Stream.MultigroupIP)[2], ((unsigned char*)&Stream.MultigroupIP)[3], Stream.MultigroupIP, Stream.DevName, WSAGetLastError());
+
+			// Do the clean up
+			WSACleanup();
+
+			// and exit with error
+			exit(-1);
+		}
+
+		//Find a possible stream to swap so we don't use a new entry
+		for (unsigned char i = 0; i < Index; ++i)
+		{
+			if (Streams[i].bFlags == S_INVALID)
+			{
+				printf("Swapping socket\n");
+				memcpy(&Streams[i], &Stream, sizeof(SDP));
+				//Reassign pointers
+				
+				//Base relocate the device name
+				Streams[i].DevName = Streams[i].Raw + (Stream.DevName - Stream.Raw);
+				Streams[i].SAPHeader = (SAP*)Streams[i].Raw;
+				Streams[i].SDPData = Streams[i].Raw + sizeof(SAP);
+				Streams[i].bFlags = S_WAIT_OPEN;
+
+				printf("Sucessfully added and replaced stream %u for device %s \n", Stream.MultigroupIP, Stream.DevName);
+
+				goto END;
+			}
+		}
+		printf("Added socket\n");
+		//Use the new entry
+		Stream.bFlags = S_WAIT_OPEN;
+		++Index;
+		++NumDevs;
+		
+
+	END:
+		;
+		
+	}
+}
+
+SOCKET SAPTrans;
+
+unsigned char CharToNum(char Char)
+{
+	if (Char >= '0' && Char <= '9')
+		return Char - '0';
+	if (Char >= 'A' && Char <= 'F')
+		return Char - 'A' + 10;
+	if (Char >= 'a' && Char <= 'f')
+		return Char - 'a' + 10;
+}
+
+bool CompareMAC(char* _MAC)
+{
+	unsigned char MAC[8];
+
+	MAC[0] = (CharToNum(_MAC[1]) ) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3;
+	MAC[1] = (CharToNum(_MAC[1])) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3; 
+	MAC[2] = (CharToNum(_MAC[1])) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3;
+	MAC[3] = (CharToNum(_MAC[1])) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3;
+	MAC[4] = (CharToNum(_MAC[1])) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3;
+	MAC[5] = (CharToNum(_MAC[1])) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3;
+	MAC[6] = (CharToNum(_MAC[1])) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3;
+	MAC[7] = (CharToNum(_MAC[1])) | (CharToNum(_MAC[0]) << 4);
+	_MAC += 3;
+	return memcmp(MAC, PTPMasterClock, 8);
+}
+
+void SAPTransmitter()
+{
+	SetThreadAffinityMask(GetCurrentThread(), 1);	//Core #1
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
+		printf("Server sender: WSAStartup failed for SAP with error %ld\n", WSAGetLastError());
+		exit(-1);
+	}
+
+	SAPTrans = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (SAPTrans == INVALID_SOCKET)
+	{
+		printf("Server sender: Error at SAP socket() : %ld\n", WSAGetLastError());
+		// Close the socket
+		closesocket(SAPTrans);
+
+		// Clean up
+		WSACleanup();
+
+		exit(-1);
+	}
+
+	bool T = true;
+
+	sockaddr_in inf = { 0 };
+	inf.sin_addr.S_un.S_addr = SelectedInterface->IP;
+	inf.sin_family = AF_INET;
+	inf.sin_port = htons(9875);
+
+	//Make sure that other applications can use this port too if they wish.
+	if (setsockopt(SAPTrans, SOL_SOCKET, SO_REUSEADDR, (char*)&T, sizeof(bool)) < 0)
+	{
+		printf("Server sender: setsockopt() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(SAPTrans);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+
+	//Make it non-blocking. EDIT: We're keeping it in a separate thread
+	unsigned long iMode = 0;
+	ioctlsocket(SAPTrans, FIONBIO, &iMode);
+	int ttl = 1;
+	setsockopt(SAPTrans, IPPROTO_IP, IP_MULTICAST_TTL, (char*)&ttl, 4);
+
+	/*if (bind(SAPTrans, (SOCKADDR*)&inf, sizeof(SOCKADDR_IN)) == SOCKET_ERROR)
+	{
+		printf("Server: bind() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(SAPTrans);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}*/
+
+	inf.sin_addr.S_un.S_addr = SAPIPAddr;// SelectedInterface->IP;
+
+
+	struct ip_mreq mreq;
+	memset(&mreq, 0, sizeof(ip_mreq));
+	mreq.imr_multiaddr.s_addr = SAPIPAddr;
+	mreq.imr_interface.s_addr = 0;// StringToIP("192.168.15.98");
+	if (setsockopt(SAPTrans, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0)
+	{
+		printf("Server sender: setsockopt() add membership failed! Error : %ld. IP %lu\n", WSAGetLastError(), mreq.imr_multiaddr.s_addr);
+		// Close the socket
+		closesocket(SAPTrans);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+	//setsockopt(SAPTrans, IPPROTO_IP, IP_MULTICAST_IF, (char*)&mreq.imr_interface, sizeof(SOCKADDR_IN));
+
+#ifdef WIN32
+	//DWORD timeout = 0;
+	//setsockopt(SAPTrans, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof timeout);
+#else
+
+#endif
+	int Mov = 0;
+	//disable loopback
+	//u_char loop = 0;
+	//setsockopt(SAPSocket, IPPROTO_IP, IP_MULTICAST_LOOP, (char*)&loop, sizeof(loop));
+	while (true)
+	{
+		if (SAPTrans)
+		{
+			for (unsigned char i = 0; i < NumTStreams; ++i)
+			{
+				//Figure out if some changes have been made to it
+				if (CompareMAC(TransmissionStreams[i].PTPMac + 30))
+				{
+					TransmissionStreams[i].SDPData = TransmissionStreams[i].PTPMac;
+					TransmissionStreams[i].SDPData += sprintf(TransmissionStreams[i].SDPData, "a=ts-refclk:ptp=IEEE1588-2008:%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X:0\x0d\x0a", PTPMasterClock[0], PTPMasterClock[1], PTPMasterClock[2], PTPMasterClock[3], PTPMasterClock[4], PTPMasterClock[5], PTPMasterClock[6], PTPMasterClock[7]);
+					TransmissionStreams[i].SDPData += sprintf(TransmissionStreams[i].SDPData, "a=mediaclk:direct=0\x0d\x0a");
+					++(*TransmissionStreams[i].SessionLoc);	
+					TransmissionStreams[i].Size = TransmissionStreams[i].SDPData - TransmissionStreams[i].Raw;
+					//This only works with values less than 10.
+					//Mov = sprintf(TransmissionStreams[i].PTPMac, "%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X", PTPMasterClock[0], PTPMasterClock[1], PTPMasterClock[2], PTPMasterClock[3], PTPMasterClock[4], PTPMasterClock[5], PTPMasterClock[6], PTPMasterClock[7]);
+					//TransmissionStreams[i].PTPMac[Mov] = ':';
+				}
+				//printf("Sending %u %u PTPClk %s\n", i, TransmissionStreams[i].Size, TransmissionStreams[i].PTPMac);
+
+
+				int s = sendto(SAPTrans, TransmissionStreams[i].Raw, TransmissionStreams[i].Size, 0, (sockaddr*)&inf, sizeof(sockaddr_in));
+				if (s < 0)
+					printf("Failed %u\n", WSAGetLastError());
+			}
+		}
+		Sleep(5000);
+	}
+	closesocket(SAPTrans);
+	
+}
+
+AOIP_API Interface* GetInterfaces()
+{
+	static Interface Interfaces[64];
+	int Index = 0;
+	memset(Interfaces, 0, sizeof(Interfaces));
+
+	PIP_ADAPTER_INFO MACS = (PIP_ADAPTER_INFO)alloca(256*4 );
+	ZeroMemory(MACS, 256 * 4);
+	unsigned long Sz = 256*4;
+
+	if (GetAdaptersInfo(MACS, &Sz) == ERROR_BUFFER_OVERFLOW)
+	{
+		MACS = (PIP_ADAPTER_INFO)alloca(Sz);
+	}
+	GetAdaptersInfo(MACS, &Sz);
+	pcap_if_t* Devs;
+
+	if (pcap_findalldevs(&Devs, PCErr) == -1)
+	{
+		printf("Error: %s\n", PCErr);
+		return nullptr;
+	}
+	for (pcap_if_t* d = Devs; d; d = d->next)
+	{
+		Interfaces[Index].Description = d->description;
+		Interfaces[Index].Name = d->name;
+		Interfaces[Index].Handle = d;
+		for (pcap_addr_t *a = d->addresses; a; a = a->next)
+		{
+			if (a->addr->sa_family == AF_INET)
+				Interfaces[Index].IP = ((sockaddr_in*)a->addr)->sin_addr.S_un.S_addr;
+		}
+
+		//We have to go look for it...
+		for(PIP_ADAPTER_INFO inf = MACS; inf; inf = inf->Next)
+		{
+			if (StringToIP(inf->IpAddressList.IpAddress.String) == Interfaces[Index].IP)
+			{
+				memcpy(Interfaces[Index].MAC, inf->Address, 8);
+				break;
+			}
+		}
+		++Index;
+	}
+	return Interfaces;
+}
+
+unsigned int PTPIP;
+unsigned short PTPPort;
+
+double GetPTPTS()
+{
+	return PTPTimeStamp + ( ((double)(GetTS() - LocalTS)) / TSFreq) + 0.069;
+}
+
+//Useful function to dump a block of data to the console
+void DumpBytes(unsigned char* Bytes, unsigned int Len)
+{
+	for (int i = 0; i < Len; ++i)
+	{
+		printf("%02X ", *Bytes++);
+	}
+}
+
+//PTP
+void PTPListener()
+{
+
+	SOCKET PTPSock;
+	SOCKADDR_IN PTPAddr;
+
+	SetThreadAffinityMask(GetCurrentThread(), 1);	//Core #1
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
+		printf("Server: WSAStartup failed for SAP with error %ld\n", WSAGetLastError());
+		exit(-1);
+	}
+
+	PTPSock = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (PTPSock == INVALID_SOCKET)
+	{
+		printf("Server: Error at SAP socket() : %ld\n", WSAGetLastError());
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Clean up
+		WSACleanup();
+
+		exit(-1);
+	}
+
+	PTPAddr.sin_addr.S_un.S_addr = 0;
+	PTPAddr.sin_family = AF_INET;
+	PTPAddr.sin_port = htons(PTPPort);
+	bool T = true;
+
+	//Make sure that other applications can use this port too if they wish.
+	if (setsockopt(PTPSock, SOL_SOCKET, SO_REUSEADDR, (char*)&T, sizeof(bool)) < 0)
+	{
+		printf("Server: setsockopt() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+
+	//Make it non-blocking. EDIT: We're keeping it in a separate thread
+	//unsigned long iMode = 1;
+	//ioctlsocket(PTPSock, FIONBIO, &iMode);
+
+	if (bind(PTPSock, (SOCKADDR*)&PTPAddr, sizeof(SOCKADDR_IN)) == SOCKET_ERROR)
+	{
+		printf("Server: bind() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+
+	struct ip_mreq mreq;
+	memset(&mreq, 0, sizeof(ip_mreq));
+	mreq.imr_multiaddr.s_addr = PTPIP;
+	mreq.imr_interface.s_addr = 0;// StringToIP("192.168.15.98");
+	if (setsockopt(PTPSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0)
+	{
+		printf("Server: setsockopt() add membership failed! Error : %ld. IP %lu\n", WSAGetLastError(), mreq.imr_multiaddr.s_addr);
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+	setsockopt(PTPSock, IPPROTO_IP, IP_MULTICAST_IF, (char*)&mreq.imr_interface, sizeof(SOCKADDR_IN));
+
+#ifdef WIN32
+	DWORD timeout = 0;
+	setsockopt(PTPSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof timeout);
+#else
+
+#endif
+
+	memset(PTPMasterClock, 0, 8);
+	PTPTimeStamp = 0;
+	unsigned char Data[256];
+	unsigned char Bytes = 0;
+	while (true)
+	{
+		Bytes = recv(PTPSock, (char*)Data, 256, 0);
+
+		if (Data[1] == 0x02)
+		{
+			if (!Data[0] && PTPTimeStamp == 0)	//Sync
+			{
+				memcpy(PTPMasterClock, Data + 20, 8);
+				if (bUpdateTS)
+				{
+
+				
+				PTPTimeStamp = ntohl((*(unsigned int*)(Data + 40)));	//ns first
+
+				//double Divisor = log10((unsigned int)PTPTimeStamp) + 1;
+				//Divisor = StaticPow10(Divisor);
+				//PTPTimeStamp /= Divisor;
+
+				//Faster
+				while (PTPTimeStamp >= 1.f)
+					PTPTimeStamp /= 10;
+
+				PTPTimeStamp += ntohl(*((unsigned int*)(Data + 36)));
+				LocalTS = GetTS();
+				printf("Updated PTP %f\n", PTPTimeStamp);
+				}
+			}
+			
+		}
+//		else	//v1
+//		{
+//			PTPHeaderv1 *Hdr = (PTPHeaderv1*)Data;
+//		}
+	}
+}
+
+void PTPFollowListener()
+{
+	SOCKET PTPSock;
+	SOCKADDR_IN PTPAddr;
+
+	SetThreadAffinityMask(GetCurrentThread(), 1);	//Core #1
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
+		printf("Server: WSAStartup failed for SAP with error %ld\n", WSAGetLastError());
+		exit(-1);
+	}
+
+	PTPSock = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (PTPSock == INVALID_SOCKET)
+	{
+		printf("Server: Error at SAP socket() : %ld\n", WSAGetLastError());
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Clean up
+		WSACleanup();
+
+		exit(-1);
+	}
+
+	PTPAddr.sin_addr.S_un.S_addr = 0;
+	PTPAddr.sin_family = AF_INET;
+	PTPAddr.sin_port = htons(320);
+	bool T = true;
+
+	//Make sure that other applications can use this port too if they wish.
+	if (setsockopt(PTPSock, SOL_SOCKET, SO_REUSEADDR, (char*)&T, sizeof(bool)) < 0)
+	{
+		printf("Server: setsockopt() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+
+	//Make it non-blocking. EDIT: We're keeping it in a separate thread
+	//unsigned long iMode = 1;
+	//ioctlsocket(PTPSock, FIONBIO, &iMode);
+
+	if (bind(PTPSock, (SOCKADDR*)&PTPAddr, sizeof(SOCKADDR_IN)) == SOCKET_ERROR)
+	{
+		printf("Server: bind() failed! Error : %ld.\n", WSAGetLastError());
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+
+	struct ip_mreq mreq;
+	memset(&mreq, 0, sizeof(ip_mreq));
+	mreq.imr_multiaddr.s_addr = StringToIP("224.0.1.129");
+	mreq.imr_interface.s_addr = 0;// StringToIP("192.168.15.98");
+	if (setsockopt(PTPSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0)
+	{
+		printf("Server: setsockopt() add membership failed! Error : %ld. IP %lu\n", WSAGetLastError(), mreq.imr_multiaddr.s_addr);
+		// Close the socket
+		closesocket(PTPSock);
+
+		// Do the clean up
+		WSACleanup();
+
+		// and exit with error
+		exit(-1);
+	}
+	setsockopt(PTPSock, IPPROTO_IP, IP_MULTICAST_IF, (char*)&mreq.imr_interface, sizeof(SOCKADDR_IN));
+
+#ifdef WIN32
+	DWORD timeout = 0;
+	setsockopt(PTPSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof timeout);
+#else
+
+#endif
+	unsigned char Data[256];
+	unsigned char Bytes = 0;
+	while (true)
+	{
+		Bytes = recv(PTPSock, (char*)Data, 256, 0);
+
+		if (Data[1] == 0x02)
+		{
+			if (Data[0] == 0x08 && PTPTimeStamp > 0 && bUpdateTS) //Follow up, only process if we have initial value.
+			{
+				//Get follow up msg
+				double TS = ntohl((*(unsigned int*)(Data + 40)));
+
+				/*double Divisor = log10((unsigned int)TS) + 1;
+				Divisor = StaticPow10(Divisor);
+				TS /= Divisor;*/
+
+				while (TS >= 1.f)
+					TS /= 10;
+				
+				TS += ntohl(*((unsigned int*)(Data + 36)));
+				TS -= PTPTimeStamp;
+
+				double CurTS = (double)GetTS() - (double)LocalTS;
+				CurTS /= TSFreq;
+				PTPTimeStamp += CurTS + TS;
+				LocalTS = GetTS();
+				//Now we have our real Timestamp.
+				printf("Updated PTP %f\n", PTPTimeStamp);
+				bUpdateTS = false;
+
+			}
+		}
+		//		else	//v1
+		//		{
+		//			PTPHeaderv1 *Hdr = (PTPHeaderv1*)Data;
+		//		}
+	}
+}
+void InitializePTP(const char* IP, unsigned int Port)
+{
+	PTPIP = StringToIP(IP);
+	PTPPort = Port;
+	
+	std::thread PTPT(&PTPListener);
+	PTPT.detach();
+
+	std::thread PTPT2(&PTPFollowListener);
+	PTPT2.detach();
+}
+
+
+u_int16_t udp_sum_calc(uint16_t len_udp, u_int32_t src_ip, u_int32_t dst_ip,
+	char unsigned * b) {
+	uint16_t prot_udp = 17;
+	uint16_t padd = 0;
+	uint16_t word16;
+	unsigned int sum;
+	int i;
+	uint16_t *buff;
+
+	buff = (uint16_t *)b;
+
+	// Find out if the length of data is even or odd number. If odd,
+	// effectively add a zero padding byte at the end of packet
+
+	padd = len_udp & 0x1;	//Much faster than division
+
+
+	//initialize sum to zero
+	sum = 0;
+
+	// make 16 bit words out of every two adjacent 8 bit words and 
+	// calculate the sum of all 16 bit words
+	for (i = 0; i < len_udp - padd; i = i + 2) {
+		word16 = (uint16_t)((*(b + i) << 8) & 0xFF00) + *(b + i + 1);
+		sum += (unsigned long)word16;
+	}
+
+	// Need padding byte?  If so, the last byte of the packet
+	// also needs to be added.
+	if (padd) 
+	{
+		word16 = (uint16_t)((*(b + i) << 8) & 0xFF00);
+		sum += (unsigned long)word16;
+	}
+
+	// add the UDP pseudo header which contains the IP source and
+	// destinationn addresses
+	word16 = src_ip & 0xFFFF;
+	sum += word16;
+	word16 = src_ip >> 16 & 0xFFFF;
+	sum += word16;
+
+	word16 = dst_ip & 0xFFFF;
+	sum += word16;
+	word16 = dst_ip >> 16 & 0xFFFF;
+	sum += word16;
+
+	// the protocol number and the length of the UDP packet  are
+	// also in the pseudoheader.
+	sum += prot_udp + len_udp;
+
+	// keep only the last 16 bits of the 32 bit calculated sum and add the carries
+	while (sum >> 16)
+		sum = (sum & 0xFFFF) + (sum >> 16);
+
+	// Take the one's complement of sum
+	sum = ~sum;
+
+	return ((uint16_t)sum);
+}
+
+uint16_t ip_checksum(void* vdata, size_t length) {
+	// Cast the data pointer to one that can be indexed.
+	char* data = (char*)vdata;
+
+	// Initialise the accumulator.
+	uint32_t acc = 0xffff;
+
+	// Handle complete 16-bit blocks.
+	for (size_t i = 0; i + 1 < length; i += 2) {
+		uint16_t word;
+		memcpy(&word, data + i, 2);
+		acc += ntohs(word);
+		if (acc > 0xffff) {
+			acc -= 0xffff;
+		}
+	}
+
+	// Handle any partial block at the end of the data.
+	if (length & 1) {
+		uint16_t word = 0;
+		memcpy(&word, data + length - 1, 1);
+		acc += ntohs(word);
+		if (acc > 0xffff) {
+			acc -= 0xffff;
+		}
+	}
+
+	// Return the checksum in network byte order.
+	return ~acc;
+}
+
+AOIP_API SDP * CreateNewStream(const char* StreamName, unsigned char ChannelOffset, unsigned char NumChannels, unsigned char NumSamples, unsigned int SampleRate)
+{
+	SDP& Stream = TransmissionStreams[NumTStreams];
+	Stream.Channels = NumChannels;
+	Stream.ByteDepth = 3;	//Maybe we make this modifiable later
+	Stream.PackSamples = NumSamples;
+	Stream.SampleRate = SampleRate;
+	Stream.Seq = 0;
+	Stream.TransmitterIP = SelectedInterface->IP;
+	Stream.MultigroupIP = GenerateIP();
+	Stream.TransmitterPort = 5004;
+	Stream.ChannelOffset = ChannelOffset;
+
+	Stream.Timestamp = 0;// rand() & 0xFFFF;
+
+	Stream.SAPHeader = (SAP*)Stream.Raw;
+	Stream.SAPHeader->AuthLen = 0;
+	((unsigned char&)Stream.SAPHeader->Flags) = 0x20;
+	Stream.SAPHeader->Hash = rand() & 0xFFFF;	//Very important for Dante controller! They will dismiss any SAP packets without Hash
+	Stream.SAPHeader->SrcIP = Stream.TransmitterIP;
+	memcpy(Stream.SAPHeader->Type, "application/sdp", 16);
+	Stream.SDPData = Stream.Raw + sizeof(SAP);
+
+	memcpy(Stream.SDPData, "v=0", 3);
+	Stream.SDPData += 3;
+
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	Stream.PacketRate = SampleRate / NumSamples;
+
+	memcpy(Stream.SDPData, "o=- ", 4);
+
+	Stream.SDPData += 4;
+
+	Stream.SessionID = rand();
+	Stream.SessionVer = 0;
+
+	union
+	{
+		unsigned int IP;
+		unsigned char Bytes[4];
+	};
+
+	IP = Stream.TransmitterIP;
+
+	Stream.SDPData += sprintf(Stream.SDPData, "%i ", Stream.SessionID );
+	Stream.SessionLoc = (char*)Stream.SDPData;
+	Stream.SDPData += sprintf(Stream.SDPData, "%i IN IP4 %u.%u.%u.%u", Stream.SessionVer, Bytes[0], Bytes[1], Bytes[2], Bytes[3]);
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	Stream.SDPData += sprintf(Stream.SDPData, "s=%s", StreamName);
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	IP = Stream.MultigroupIP;
+
+	Stream.SDPData += sprintf(Stream.SDPData, "c=IN IP4 %u.%u.%u.%u/32", Bytes[0], Bytes[1], Bytes[2], Bytes[3]);
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	memcpy(Stream.SDPData, "t=0 0", 5);
+	Stream.SDPData += 5;
+
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	Stream.SDPData += sprintf(Stream.SDPData, "a=keywds:%s", DevName);
+	//Stream.SDPData += 14;
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	Stream.SDPData += sprintf(Stream.SDPData, "m=audio %i RTP/AVP 103", Stream.TransmitterPort);
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+	++ChannelOffset;
+//	if (NumChannels < 3)
+//	{
+//		Stream.SDPData += sprintf(Stream.SDPData, "i=%u channels: Left, Right", NumChannels);
+		//Stream.SDPData += sprintf(Stream.SDPData, "i=RAVENNA Send 1/0,RAVENNA Send 1/1");
+
+	//}
+	//else
+	{
+		Stream.SDPData += sprintf(Stream.SDPData, "i=%u channels: %02d", NumChannels, ChannelOffset);
+		//Stream.SDPData += sprintf(Stream.SDPData, "i=RAVENNA Send 1/0,RAVENNA Send 1/1");
+		for (int i = 1; i < NumChannels; ++i)
+		{
+			Stream.SDPData += sprintf(Stream.SDPData, ", %02d", i + ChannelOffset);
+		}
+	}
+
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	memcpy(Stream.SDPData, "a=recvonly", 10);
+	Stream.SDPData += 10;
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	Stream.SDPData += sprintf(Stream.SDPData, "a=rtpmap:103 L24/%d/%d", SampleRate, NumChannels);
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+
+	memcpy(Stream.SDPData, "a=ptime:1", 9);
+	Stream.SDPData += 9;
+	*Stream.SDPData++ = 0x0d;
+	*Stream.SDPData++ = 0x0a;
+	Stream.PTPMac = Stream.SDPData;
+	Stream.SDPData += sprintf(Stream.SDPData, "a=ts-refclk:ptp=IEEE1588-2008:00-00-00-00-00-00-00-00:0\x0d\x0a");
+	Stream.SDPData += sprintf(Stream.SDPData, "a=mediaclk:direct=%u\x0d\x0a", Stream.Timestamp);
+
+
+	Stream.Size = Stream.SDPData - Stream.Raw;
+	
+	++NumTStreams;
+	//Done?
+
+	Stream.DataSize = (Stream.PackSamples * Stream.Channels * Stream.ByteDepth) + FRAMESIZE;
+	Stream.SampleData = (unsigned char*)malloc(Stream.DataSize);
+	
+	//Prepare network packet
+	FRAME* DataFrame = (FRAME*)Stream.SampleData;
+	const char FrameData[] =
+		"\x01\x00\x5e\x45\x95\x83\x00\x1d\xc1\x50\x73\x1b\x08\x00\x45\xb8" \
+		"\x01\x48\x00\x00\x40\x00\x20\x11\x04\x1b\xc0\xa8\x0f\x61\xef\x45" \
+		"\x95\x83\xf0\x00\x13\x8c\x01\x34\x8c\xdb\x80\x61\x8b\x0d\xa0\x8f" \
+		"\xfa\x1e\x2d\xcd\x44\x60";
+	memcpy(DataFrame, FrameData, sizeof(FrameData));
+
+	//Copy MAC data
+
+	//((int&)DataFrame->Eth.DestMAC[3]) = (SelectedInterface->IP & 0x7FFFFF);
+	unsigned int MIP = htonl(Stream.MultigroupIP);
+	DataFrame->Eth.DestMAC[3] = (MIP >> 16) & 0x7F;
+	DataFrame->Eth.DestMAC[4] = (MIP >> 8);
+	DataFrame->Eth.DestMAC[5] = (MIP);
+
+	DataFrame->Eth.SrcMAC[0] = SelectedInterface->MAC[0];
+	DataFrame->Eth.SrcMAC[1] = SelectedInterface->MAC[1];
+	DataFrame->Eth.SrcMAC[2] = SelectedInterface->MAC[2];
+	DataFrame->Eth.SrcMAC[3] = SelectedInterface->MAC[3];
+	DataFrame->Eth.SrcMAC[4] = SelectedInterface->MAC[4];
+	DataFrame->Eth.SrcMAC[5] = SelectedInterface->MAC[5];
+	//IP4 Header
+	DataFrame->IPHdr.DestIP = (Stream.MultigroupIP);
+	DataFrame->IPHdr.Len = htons(Stream.DataSize - 14); //UDP Size
+	DataFrame->IPHdr.SourceIP = SelectedInterface->IP;
+	DataFrame->UDP.DestPort = htons(Stream.TransmitterPort);
+	DataFrame->UDP.SourcePort = (rand() + 1024) & 0xFFFF;
+	DataFrame->UDP.Len = htons(Stream.DataSize - 34);
+
+	DataFrame->IPHdr.Checksum = 0;
+	DataFrame->IPHdr.Checksum = htons(ip_checksum(&DataFrame->IPHdr, sizeof(IP4)));
+
+	DataFrame->RTP.Type = 0x67;
+	DataFrame->RTP.ssrc = rand();
+	return &Stream;
+}
+
+
+
+AOIP_API void InitializeEngine(double _IntervalFreq, timer _Callback, unsigned char _SampleDelay, float *Buffer)
+{
+	IntervalFreq = _IntervalFreq;
+	Timer = _Callback;
+	SampleDelay = _SampleDelay;
+	OutBuffer = Buffer;
+
+
+	//RTPThread.detach();
+
+	
+	//PollThread.detach();
+	//MainLoop();
+}
+
+
+typedef unsigned long long(*TSC)();
+
+//Raw packet helpers
+
+//Destination IP
+unsigned int GetDstIP(const char* data)
+{
+	return (*((unsigned int*)(data + 30)));
+}
+
+unsigned int GetSrcIP(const char* data)
+{
+	return  (*((unsigned int*)(data + 26)));
+}
+
+unsigned short GetSrcPort(const char* data)
+{
+	return (*((unsigned short*)(data + 34)));
+}
+
+unsigned short GetDstPort(const char* data)
+{
+	return (*((unsigned short*)(data + 36)));
+}
+
+unsigned int GetTimestamp(const char* data)
+{
+	return ntohl(*((unsigned int*)(data + RTPTSOFFSET)));
+}
+
+SDP* GetStream(unsigned int IP)
+{
+	for (unsigned char i = 0; i < Index; ++i)
+	{
+		if (Streams[i].MultigroupIP == IP)
+			return &Streams[i];
+	}
+	return nullptr;
+}
+
+static inline unsigned int ToInt(float x)
+{
+	x += 1.f;
+	return 8388608 * x;
+}
+
+static inline unsigned int ToInt16(float x)
+{
+	x += 1.f;
+	return 32768 * x;
+}
+
+static inline float ToFloat(unsigned int Sample)
+{
+	return ((long long)Sample - 8388608) * (1.0 / 8388608);
+}
+
+
+//High-performing network loop
+void MainLoop()
+{
+
+	//Configure thread to run on a separate core if possible and set max priority.
+	//We don't care about hyperthreading because hyperthreading doesn't cause context switches in the kernel. So we want to set the affinity to one CPU regardless.
+	//For more throughput, disable HyperThreading.
+	int ThreadCount;
+	TSC GetTimeStamp;
+#ifdef WIN32
+	SYSTEM_INFO si = { 0 };
+	GetSystemInfo(&si);
+	ThreadCount = si.dwNumberOfProcessors;
+#else
+	//TODO: Implement Linux
+	ThreadCount = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+
+	if (ThreadCount >= 4)
+	{
+#ifdef WIN32
+		if (!SetThreadAffinityMask(GetCurrentThread(), 2))
+			printf("WARNING!!!! Failed to set CPU affinity %u\n", GetLastError());//Core #2
+		SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+		if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL))
+			printf("WARNING!!!! Failed to set priority\n");
+#else
+
+#endif
+	}
+	else
+	{
+		printf("Warning: You need a Quad core CPU or better to run this driver.\n");
+		exit(1);
+	}
+
+	double TSCAbsInterval = 1.f / (double)IntervalFreq;//(double)TSCFreq / (double)IntervalFreq;	//Number of ticks per interval
+	printf("TSCFreq %llu, Packet time %fs\n", TSFreq, TSCAbsInterval);
+	
+	//Timer absolute values.
+	double Start;// Moved to global scope
+	double	Stop;
+	unsigned long long LocalDelta;
+
+	//Open PCAP socket
+	if ((listener = pcap_create(SelectedInterface->Name, PCErr)) == NULL)
+	{
+		printf("Error: %s\n", PCErr);
+		exit(1);
+	}
+	
+	//if (pcap_set_timeout(listener, 1) < 0)
+	{
+	//	printf("Error: Failed to set timeout\n");
+	//	exit(1);
+	}
+
+	if (pcap_set_immediate_mode(listener, true) < 0)
+	{
+		printf("Error: Failed to set immediate mode\n");
+		exit(1);
+	}
+	//pcap_set_promisc(listener, 1);
+
+	int Val;
+	if ((Val = pcap_activate(listener)) < 0)
+	{
+		printf("Error: %u\n", Val);
+		exit(1);
+	}
+	if (Val > 0)
+		printf("Warning: %u\n", Val);
+	
+	if (pcap_datalink(listener) != DLT_EN10MB)
+	{
+		printf("Warning: This driver only operates on Ethernet based interfaces\nEngine deinitialized\n");
+		return;
+	}
+
+	unsigned int Netmask;
+	if (((pcap_if_t*)SelectedInterface->Handle)->addresses)
+		Netmask = ((SOCKADDR_IN*)((pcap_if_t*)SelectedInterface->Handle)->addresses->netmask)->sin_addr.S_un.S_addr;
+	else
+		Netmask = 0xFFFFFFFF;
+
+	const char* Filter = "ip multicast";
+	struct bpf_program fcode;
+	if (pcap_compile(listener, &fcode, Filter, 1, Netmask) < 0)
+	{
+		printf("Error: Filter syntax\n");
+		exit(1);
+	}
+
+	if (pcap_setfilter(listener, &fcode) < 0)
+	{
+		printf("Error: failed to apply filter\n");
+		exit(1);
+	}
+
+	if (pcap_setnonblock(listener, 1, PCErr) < 0)
+	{
+		printf("Failed to set listener non-blocking %s\n", PCErr);
+		exit(1);
+	}
+
+	struct ip_mreq mreq;
+	memset(&mreq, 0, sizeof(ip_mreq));
+	mreq.imr_multiaddr.s_addr = StringToIP("224.0.1.129");
+	mreq.imr_interface.s_addr = 0;// StringToIP("192.168.15.98");
+	if (setsockopt(socket(AF_INET, SOCK_DGRAM, 0), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0)
+	{
+		printf("RTP Listener: setsockopt() add membership failed! Error : %ld. IP %lu\n", WSAGetLastError(), mreq.imr_multiaddr.s_addr);
+		// and exit with error
+		exit(-1);
+	}
+
+	pcap_pkthdr *Header;
+	const unsigned char *Data;
+	SDP * Stream = nullptr;
+	unsigned int k = 0;
+
+	//TIMER_START
+	
+	while (NumDevs < 1)	//Don't do anthing until we have at least one device.
+		Sleep(2000);
+
+
+	int Status = 0;
+	while (k < 5000)	//Clean out the buffer
+	{
+		pcap_next_ex(listener, &Header, &Data);
+		++k;
+	}
+	
+	const unsigned int IPMask = (239);// | IPPrefix << 8; //239.XX whatever subnet we want to accept
+	Start = 0;
+	Stop = 0;
+	PTPTimeStamp = 0;
+
+	const unsigned int SampleStep = (Streams[0].SampleRate / IntervalFreq);
+
+	for (unsigned char i = 0; i < NumTStreams; ++i)
+	{
+		TransmissionStreams[i].Timestamp = 0;
+		TransmissionStreams[i].Seq = 0;
+	}
+	printf("Listening to %s %f\n", SelectedInterface->Description, Start);
+	unsigned int kkp = 0;
+	std::string grr;
+	grr.reserve(4096);
+	//Wait for PTP clock
+	while (Start == 0.f) //We can't check for a litteral zero since it's not a binary number.
+	{
+		Status = pcap_next_ex(listener, &Header, &Data);
+
+		//Wait for ptp packet
+
+		if (Status != 1)
+			continue;
+
+		if (GetDstIP((const char*)Data) == ( (129 << 24) | (1 << 16) | (0 << 8) | 224) && Header->len == 86)
+		{
+			printf("Got packet %u\n", ntohs(GetDstPort((const char*)Data)));
+			//Sync msg
+			if (ntohs(GetDstPort((const char*)Data)) == 319)
+			{
+				//Update PTP Master address
+			/*	*((unsigned long long*)PTPMasterClock) = *((unsigned long long*)(Data + 20 + UDPPAYLOAD));
+
+
+				PTPTimeStamp = ntohl((*(unsigned int*)(Data + 40 + UDPPAYLOAD)));	//ns first
+
+					//double Divisor = log10((unsigned int)PTPTimeStamp) + 1;
+					//Divisor = StaticPow10(Divisor);
+					//PTPTimeStamp /= Divisor;
+
+					//Faster
+				
+
+				while (PTPTimeStamp >= 1.f)
+					PTPTimeStamp /= 10;
+				PTPTimeStamp += ntohl(*((unsigned int*)(Data + 36 + UDPPAYLOAD)));*/
+				LocalTS = GetTS();	//We need to calculate local delay
+			}
+			//Follow up
+			else if (ntohs(GetDstPort((const char*)Data)) == 320 && LocalTS)
+			{
+				//Get follow up msg
+				double TS = ntohl((*(unsigned int*)(Data + 40 + UDPPAYLOAD)));
+
+				/*double Divisor = log10((unsigned int)TS) + 1;
+				Divisor = StaticPow10(Divisor);
+				TS /= Divisor;*/
+
+				while (TS >= 1.f)
+					TS /= 10;
+				//Timestamp on delivery
+				TS += ntohl(*((unsigned int*)(Data + 36 + UDPPAYLOAD)));
+
+				//Calculate follow up delay
+				double CurTS = (double)GetTS() - (double)LocalTS;
+				CurTS /= (double)TSFreq;
+				Start = CurTS + TS;
+				Stop = Start + TSCAbsInterval;
+				LocalDelta = GetTS();
+				//LocalTS = 0;
+				break;
+			}
+		}
+	}
+
+	unsigned short ReadIndex = GStepperIndex = 0;
+	unsigned char WriteIndex = 0;
+	unsigned long long TestStart = 0;
+	while (bRTPMain)	//Mainloop
+	{
+
+		while (Start < Stop) //Frame loop 1ms typically
+		{
+			if (ReadIndex != GStepperIndex)	//Make sure we have data to process
+			{
+				for (unsigned char i = 0; i < 3; ++i)
+				{
+					for (int i = 0; i < ChannelCount; ++i)
+						memcpy(OutBuffer + (i * 16), &ChannelData[i][ReadIndex], (16 * 4));
+					Timer(ChannelCount, WriteIndex);
+					ReadIndex += 16;
+					WriteIndex += 16;
+					ReadIndex &= 0x3FF;
+				}
+			}
+			if (WriteIndex == 48)
+			{
+				for (unsigned char i = 0; i < NumTStreams; ++i)
+				{
+					if (!TransmissionStreams[i].Timestamp)
+					{
+						TransmissionStreams[i].Timestamp = ((unsigned int)( ((Start + 0.0022) * 48000.0)));
+					}
+
+					((FRAME*)TransmissionStreams[i].SampleData)->RTP.TS = htonl(TransmissionStreams[i].Timestamp);
+					((FRAME*)TransmissionStreams[i].SampleData)->RTP.seq_num = htons(TransmissionStreams[i].Seq);
+					((FRAME*)TransmissionStreams[i].SampleData)->UDP.CRC = 0;
+					//((FRAME*)TransmissionStreams[i].SampleData)->UDP.CRC = htons(udp_sum_calc(TransmissionStreams[i].DataSize + sizeof(UDPHeader), ((FRAME*)TransmissionStreams[i].SampleData)->IPHdr.SourceIP, ((FRAME*)TransmissionStreams[i].SampleData)->IPHdr.DestIP, (unsigned char*)&((FRAME*)TransmissionStreams[i].SampleData)->UDP ));
+					pcap_sendpacket(listener, TransmissionStreams[i].SampleData, TransmissionStreams[i].DataSize);
+					if (!TestStart)
+						TestStart = GetTS();
+					TransmissionStreams[i].Timestamp += 48;
+					++TransmissionStreams[i].Seq;
+				}
+				WriteIndex = 0;
+				//Delta = Start;
+			}
+
+
+			Status = pcap_next_ex(listener, &Header, &Data);
+			if (Status == 1)
+			{
+				if (Header->len > 300 && (GetDstIP((const char*)Data) & 0x000000FF) == IPMask && (Stream = GetStream(GetDstIP((const char*)Data))) != nullptr)
+				{
+					if (Stream->bFlags & S_WAIT_OPEN)
+					{
+						//Calculate number of packets per second, and mark stream as ready.
+						Stream->PackSamples = (((Header->len - PAYLOADOFFSET) / Stream->Channels /* Sample chunk for one channel*/) / (Stream->ByteDepth));
+						Stream->FrameSamples = (Stream->SampleRate / Stream->PackSamples) / IntervalFreq;	// (48000 / 48) / 1000 = 1 packet per frame. (48000 / 24) / 1000 = 2 packets per frame
+						Stream->PacketIndex = 0;
+						Stream->SampleIndex = 0;
+						Stream->Timestamp = GetTimestamp((char*)Data);
+						unsigned char Offset = (Stream->Timestamp % Stream->PackSamples);	//Get the offset by modular remainder from the timestamp. This will be the starting point in the stream effectively
+																							//This needs to be properly tested for smaller sample packets
+						Stream->SampleIndex = Offset + GStepperIndex;
+						/*
+							Dante stores the samples as Sample1 channel 1 - n, sample2 channel 1 - n...
+							We need to change that to channel 1: sample 1 - n, channel2 sample 1 - n...
+						*/
+						//This is going to be slower because it needs to be padded to 32 bits from 24
+						Data += PAYLOADOFFSET;
+						for (unsigned char i = 0; i < Stream->PackSamples; ++i)
+						{
+							for (unsigned char j = 0; j < Stream->Channels; ++j)
+							{	//TODO: Implement SSE2 to use 4 at once or even AVX512 if possible
+								ChannelData[Stream->Device->ChannelOffset + Stream->ChannelOffset + j][Stream->SampleIndex] = ToFloat(
+									Data[(i * (Stream->Channels * 3)) + (j * 3)] << 16
+									| Data[(i * (Stream->Channels * 3)) + (j * 3) + 1] << 8
+									| Data[(i * (Stream->Channels * 3)) + (j * 3) + 2]);	//Deal with endianness here.
+							}
+
+
+							++Stream->SampleIndex;
+							Stream->SampleIndex &= 0x3FF;
+						}
+						Stream->bFlags = S_OPEN;
+					}
+					else if (Stream->bFlags & S_OPEN)
+					{
+						//Deal with dropped packets
+
+						if (Stream->Timestamp + Stream->PackSamples < GetTimestamp((char*)Data))
+						{
+							Stream->SampleIndex += Stream->PackSamples;
+							Stream->SampleIndex &= 0x3FF;	//1023
+						}
+
+						//Add samples
+						Stream->Timestamp = GetTimestamp((char*)Data);
+						Data += PAYLOADOFFSET;
+						for (unsigned short i = 0; i < Stream->PackSamples; ++i)
+						{
+							for (int j = 0; j < Stream->Channels; ++j)
+							{
+								ChannelData[Stream->Device->ChannelOffset + Stream->ChannelOffset + j][Stream->SampleIndex] = ToFloat(
+									Data[(i * (Stream->Channels * 3)) + (j * 3)] << 16
+									| Data[(i * (Stream->Channels * 3)) + (j * 3) + 1] << 8
+									| Data[(i * (Stream->Channels * 3)) + (j * 3) + 2]);
+							}
+							++Stream->SampleIndex;
+							Stream->SampleIndex &= 0x3FF;
+						}
+						//printf("SampleIndex %u, DevChOffset %u, stchoffset %u\n", Stream->SampleIndex, Stream->Device->ChannelOffset, Stream->ChannelOffset);
+					}
+				}
+
+				//PTP sync
+				else if (Header->len == 86)
+				{
+					//Sync msg
+					if (ntohs(GetDstPort((const char*)Data)) == 319)
+					{
+						//Update PTP Master address
+						LocalTS = GetTS();
+						//*((unsigned long long*)PTPMasterClock) = *((unsigned long long*)(Data + 20 + UDPPAYLOAD));
+							//We need to calculate local delay
+					}
+
+					//Follow up
+					else if (ntohs(GetDstPort((const char*)Data)) == 320 && LocalTS)
+					{
+						//Get follow up msg
+						double TS = ntohl(*((unsigned int*)(Data + 40 + UDPPAYLOAD)));
+
+						//double Divisor = log10((unsigned int)TS) + 1;
+						//Divisor = StaticPow10(Divisor);
+						//TS /= Divisor;
+
+						while (TS >= 1.f)
+							TS /= 10;
+						//Timestamp on delivery
+						TS += ntohl(*((unsigned int*)(Data + 36 + UDPPAYLOAD)));
+
+						//Calculate follow up delay
+						unsigned long long TempDelta = GetTS();
+						double CurTS = 0;// (TempDelta - LocalTS);
+						//CurTS /= TSFreq;
+
+						if ( fabs((CurTS + TS) - Start) >= 0.0015)
+						{
+							LocalTS = 0;
+							goto FIN;	//Skip bogus packets
+
+						}
+						//grr += std::to_string((CurTS + TS) - Start);
+						//grr += "\n";
+						//
+						//LocalDelta = TempDelta;
+						//Start = CurTS + TS;
+						LocalTS = 0;
+					}
+				}
+			}
+			FIN:
+			unsigned long long TempDelta = GetTS();
+			Start += ( ((double)(TempDelta - LocalDelta)) / TSFreq);	//Increment by delta time
+			LocalDelta = TempDelta;
+			//grr += std::to_string(Start);
+			//grr += "\n";
+		}
+		//grr += std::to_string(((double)(GetTS() - Sm)) / TSFreq);
+		//grr += " Master ";
+		//grr += std::to_string(GStepperIndex);
+		//grr += "\n";
+		//grr += "\n";
+		//Increment the frame sample index
+		GStepperIndex += SampleStep;
+		GStepperIndex &= 0x3FF;
+		Stop += TSCAbsInterval;
+		//LocalTS = 0;
+		++kkp;
+	}
+	unsigned long long Fin = GetTS() - TestStart;
+
+	printf("%f\n", (double)Fin / (double)TSFreq);
+	printf("%s\n", grr.c_str());
+	printf("LOOP ENDED UNEXPECTEDLY\n");
+}
+
+void PollLoop()
+{
+	return;
+
+
+	int ThreadCount;
+	TSC GetTimeStamp;
+#ifdef WIN32
+	SYSTEM_INFO si = { 0 };
+	GetSystemInfo(&si);
+	ThreadCount = si.dwNumberOfProcessors;
+#else
+	//TODO: Implement Linux
+	ThreadCount = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+
+	if (ThreadCount >= 4)
+	{
+#ifdef WIN32
+		if (!SetThreadAffinityMask(GetCurrentThread(), 8))
+			printf("WARNING!!!! Failed to set CPU affinity %u\n", GetLastError());//Core #2
+		SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+		if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL))
+			printf("WARNING!!!! Failed to set priority\n");
+#else
+
+#endif
+	}
+	else
+	{
+		printf("Warning: You need a Quad core CPU or better to run this driver.\n");
+		exit(1);
+	}
+	int k = 0;
+	while (Start == 0.f) Sleep(1);	//Don't optimize it away
+	printf("Transmitting\n");
+
+	//double	Stop = TSCAbsInterval;
+	
+	for (unsigned char i = 0; i < NumTStreams; ++i)
+	{
+		TransmissionStreams[i].Timestamp = 0;
+	}
+
+
+	unsigned short ReadIndex = GStepperIndex;
+	unsigned char WriteIndex = 0;
+	unsigned int kkj = 0;
+	std::string ppr;
+	ppr.reserve(4096);
+
+	unsigned long long Time = GetTS();
+	while (bRTPCB && kkj < 1000)
+	{
+		if (ReadIndex != GStepperIndex)	//Make sure we have data to process
+		{
+			for (int i = 0; i < ChannelCount; ++i)
+				memcpy(OutBuffer + (i * 16), &ChannelData[i][ReadIndex], (16 * 4));
+			Timer(ChannelCount, WriteIndex);
+			ReadIndex += 16;
+			WriteIndex += 16;
+			ReadIndex &= 0x3FF;
+		}
+		if(WriteIndex == 48)
+		{
+			for (unsigned char i = 0; i < NumTStreams; ++i)
+			{
+				if (!TransmissionStreams[i].Timestamp)
+				{
+					unsigned int Normal = ((unsigned int)((Start * 48000.0) + 0.069));
+					TransmissionStreams[i].Timestamp = Normal;
+				}
+				((FRAME*)TransmissionStreams[i].SampleData)->RTP.TS = htonl(TransmissionStreams[i].Timestamp);
+				((FRAME*)TransmissionStreams[i].SampleData)->RTP.seq_num = htons(TransmissionStreams[i].Seq);
+				((FRAME*)TransmissionStreams[i].SampleData)->UDP.CRC = 0;
+				//((FRAME*)TransmissionStreams[i].SampleData)->UDP.CRC = htons(udp_sum_calc(TransmissionStreams[i].DataSize + sizeof(UDPHeader), ((FRAME*)TransmissionStreams[i].SampleData)->IPHdr.SourceIP, ((FRAME*)TransmissionStreams[i].SampleData)->IPHdr.DestIP, (unsigned char*)&((FRAME*)TransmissionStreams[i].SampleData)->UDP ));
+				pcap_sendpacket(listener, TransmissionStreams[i].SampleData, TransmissionStreams[i].DataSize);
+				TransmissionStreams[i].Timestamp += 48;
+				++TransmissionStreams[i].Seq;
+			}
+			WriteIndex = 0;
+			++kkj;
+			ppr += std::to_string( ((double)(GetTS() - Time)) / TSFreq );
+			ppr += " Slave ";
+			ppr += std::to_string(GStepperIndex);
+			ppr += "\n";
+			//Delta = Start;
+		}
+	}
+	printf("%s", ppr.c_str());
+	//printf("10k packets %f\n", Delta);
+	printf("Stopped transmission\n");
+}
+
+AOIP_API void BeginSAPTransmission()
+{
+	std::thread SAPTrans(&SAPTransmitter);
+	bSAPTrans = true;
+	SAPTrans.detach();
+}
+
+AOIP_API void EndSAPTransmission()
+{
+	bSAPTrans = false;
+}
+
+AOIP_API void BeginSAP()
+{
+	bSAPMain = true;
+	///////C++11 threads are really weak.
+	SAPThread = std::thread(&SAPListener);
+	SAPThread.detach();
+}
+
+AOIP_API void EndSAP()
+{
+	bSAPMain = false;
+}
+
+AOIP_API void BeginRTPRecv()
+{
+	bRTPMain = true;
+	bRTPCB = true;
+	RTPThread = std::thread(&MainLoop);
+	PollThread = std::thread(&PollLoop);
+	RTPThread.detach();
+	PollThread.detach();
+}
+
+AOIP_API void EndRTPRecv()
+{
+	bRTPMain = false;
+}
+
+AOIP_API void BeginRTPTransmission()
+{
+	bRTPTrans = true;
+}
+
+AOIP_API void EndRTPTransmission()
+{
+	bRTPTrans = false;
+}
+
+AOIP_API void ResumeRTPCallback()
+{
+	if (bRTPCB) return;
+	bRTPCB = true;
+	PollThread = std::thread(&PollLoop);
+	PollThread.detach();
+}
+
+AOIP_API void PauseRTPCallback()
+{
+	bRTPCB = false;
+}
+
+AOIP_API void SetIPPrefix(unsigned char IP)
+{
+	IPPrefix = IP;
+}
+
+AOIP_API void InitializeIf(Interface* _If)
+{
+	SelectedInterface = _If;
+}

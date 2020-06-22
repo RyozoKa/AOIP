@@ -1,0 +1,31 @@
+﻿  AOIP.cpp
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(54,22): warning C4200:  nonstandard extension used: zero-sized array in struct/union
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(54,22): message :  This member will be ignored by a defaulted constructor or copy/move assignment operator
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(316,22): warning C4267:  'initializing': conversion from 'size_t' to 'int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(612,32): warning C4244:  '=': conversion from '__int64' to 'unsigned short', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(649,33): warning C4244:  '=': conversion from '__int64' to 'unsigned char', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(658,27): warning C4244:  '=': conversion from '__int64' to 'unsigned int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(666,25): warning C4244:  '=': conversion from '__int64' to 'unsigned char', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(730,17): warning C4244:  'return': conversion from 'float' to 'int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(736,15): warning C4244:  'return': conversion from 'float' to 'int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1271,67): warning C4244:  '=': conversion from '__int64' to 'unsigned short', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1351,20): warning C4018:  '<': signed/unsigned mismatch
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1596,32): warning C4244:  '=': conversion from '__int64' to 'unsigned short', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1678,20): warning C4018:  '<': signed/unsigned mismatch
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1962,65): warning C4244:  '=': conversion from 'unsigned __int64' to 'double', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1968,17): warning C4244:  '=': conversion from 'double' to 'unsigned __int64', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2032,17): warning C4244:  'initializing': conversion from 'unsigned __int64' to 'double', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2219,71): warning C4244:  '=': conversion from 'unsigned __int64' to 'unsigned int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1761,21): warning C4101:  'LocalTS': unreferenced local variable
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1717,6): warning C4101:  'GetTimeStamp': unreferenced local variable
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2309,10): warning C4244:  'argument': conversion from '_Ty' to 'unsigned char', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2309,10): warning C4244:         with
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2309,10): warning C4244:         [
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2309,10): warning C4244:             _Ty=unsigned short
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2309,10): warning C4244:         ]
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2471,30): warning C4267:  'initializing': conversion from 'size_t' to 'int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2483,12): warning C4244:  'initializing': conversion from 'unsigned __int64' to 'double', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2484,13): warning C4244:  'initializing': conversion from 'unsigned __int64' to 'double', possible loss of data
+  dllmain.cpp
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2490,14): warning C4244:  '=': conversion from 'unsigned __int64' to 'double', possible loss of data
+LINK : fatal error LNK1181: cannot open input file 'Packet.lib'

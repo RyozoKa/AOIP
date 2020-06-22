@@ -1,0 +1,38 @@
+TA67Interface = packed record
+     name: PChar;
+     desc: PChar;
+     ipaddr: Integer;
+     mac: array[0..15] of byte;
+     handle: Integer;
+     end;
+
+	 type
+		TCallback = function(Channels: Byte; SendOffset:UShort);
+
+TA67DEVICE = packed record
+     DevName: PChar;
+     ipaddr: Integer;
+     chans: Byte;
+     choffset: byte;
+     end;
+
+	 procedure SetIPPrefix(PAnisChar); stdcall; external 'AOIP.dll' name '?SetIPPrefix@@YAXE@Z';
+	 procedure PByte GetTxBuffer(Byte); stdcall; external 'AOIP.dll' name '?GetTxBuffer@@YAPAEE@Z';
+
+	 procedure InitializeIf(PTA67Interface); stdcall; external 'AOIP.dll' name '?InitializeIf@@YAXPAUInterface@@@Z';
+	 procedure InitializeSAP(PAnsiChar); stdcall; external 'AOIP.dll' name '?InitializeSAP@@YAXPBD@Z';
+
+	 procedure InitializeEngine(Double; TCallback; Byte; PSingle); stdcall; external 'AOIP.dll' name 'InitializeEngine@@YAXNP6AXEG@ZEPAM@Z';
+	 procedure SetDeviceName(PAnsiChar); stdcall; external 'AOIP.dll' name '?SetDeviceName@@YAXPBD@Z';
+	 procedure CreateNewStream(PAnsiChar; Byte; Byte; Byte; Integer); 
+
+	 procedure PTA67Interface GetInterfaces(); stdcall; external 'AOIP.dll' name 'GetInterfaces@@YAPAUInterface@@XZ';
+
+	 procedure BeginSAP(); stdcall; external 'AOIP.dll' name '?BeginSAP@@YAXXZ';
+	 procedure EndSAP(); stdcall; external 'AOIP.dll' name '?EndSAP@@YAXXZ';
+	 procedure BeginSAPTransmission(); stdcall; external 'AOIP.dll' name '?BeginSAPTransmission@@YAXXZ';
+	 procedure EndSAPTransmission(); stdcall; external 'AOIP.dll' name '?EndSAPTransmission@@YAXXZ';
+
+
+	 procedure BeginRTPRecv(); stdcall; external 'AOIP.dll' name '?BeginRTPRecv@@YAXXZ';
+	 procedure EndRTPRecv(); stdcall; external 'AOIP.dll' name '?EndRTPRecv@@YAXXZ';

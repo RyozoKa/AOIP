@@ -1,0 +1,399 @@
+#pragma once
+
+#if defined WIN32
+#include <winsock2.h>
+#include <WS2tcpip.h>
+#else
+#define closesocket close
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
+#endif 
+
+#ifdef EXPORT
+#define AOIP_API __declspec(dllexport)
+#else
+#define AOIP_API __declspec(dllimport)
+#endif
+
+#define S_INVALID 0x0
+#define S_WAIT_OPEN 0x1
+#define S_OPEN 0x2
+#define S_WAIT_CLOSE 0x4
+#define S_CLOSED 0x8
+
+
+
+#ifdef WIN32
+
+#define PACKED
+#pragma pack(push,1)
+
+#else
+#define PACKED __attribute__ ((__packed__))
+#endif
+
+struct RTPHeader
+{
+	//first byte
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+	unsigned char         CC : 4;        /* CC field */
+	unsigned char         X : 1;         /* X field */
+	unsigned char         P : 1;         /* padding flag */
+	unsigned char         version : 2;
+#elif G_BYTE_ORDER == G_BIG_ENDIAN
+	unsigned char         version : 2;
+	unsigned char         P : 1;         /* padding flag */
+	unsigned char         X : 1;         /* X field */
+	unsigned char         CC : 4;        /* CC field*/
+#else
+#error "G_BYTE_ORDER should be big or little endian."
+#endif
+	union
+	{
+		//second byte
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+		unsigned char         PT : 7;     /* PT field */
+		unsigned char         M : 1;       /* M field */
+#elif G_BYTE_ORDER == G_BIG_ENDIAN
+		unsigned char         M : 1;         /* M field */
+		unsigned char         PT : 7;       /* PT field */
+#else
+#error "G_BYTE_ORDER should be big or little endian."
+#endif
+		unsigned char Type;
+	};
+	unsigned short              seq_num;      /* length of the recovery */
+	unsigned int				TS;                   /* Timestamp */
+	unsigned int				ssrc;
+
+	unsigned char Data[];
+}; //12 bytes
+
+static_assert(sizeof(RTPHeader) == 12, "RTPHeader size doesn't seem to be cool.");
+
+struct SAP
+{
+	union
+	{
+		unsigned char Flags;
+
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+		unsigned char bCompression : 1;
+		unsigned char bEncrypted : 1;
+		unsigned char MsgType : 1;
+		unsigned char Reserved : 1;
+		unsigned char AddrType : 1;
+		unsigned char Version : 3;
+#elif G_BYTE_ORDER == G_BIG_ENDIAN
+		unsigned char Version : 3;
+		unsigned char AddrType : 1;
+		unsigned char Reserved : 1;
+		unsigned char MsgType : 1;
+		unsigned char bEncrypted : 1;
+		unsigned char bCompression : 1;
+#else 
+#error "G_BYTE_ORDER should be big or little endian."
+#endif
+
+	} Flags;
+
+	unsigned char AuthLen;
+	unsigned short Hash;
+	unsigned int SrcIP;
+	char Type[16];
+};
+
+struct SDP
+{
+	SAP *SAPHeader;
+
+	char* PTPMac;
+	char* SDPData;
+
+	char Raw[400];
+
+	//Media Data
+	unsigned short TransmitterPort;
+	unsigned int TransmitterIP;
+	unsigned int MultigroupIP;
+	char* DevName;
+	unsigned int SampleRate; //Samples * frequency
+	unsigned char Channels;
+	unsigned char ByteDepth;	//Usually this will always be 24 bits or more, represented in bytes.
+
+	//Control flow
+	unsigned char PackSamples;
+	unsigned char FrameSamples;
+	unsigned char PacketPerFrame;	// FrameSamples / PackSamples
+
+	//Per iteration
+	unsigned char PacketIndex;
+
+	//Sequence
+	unsigned short Seq;
+
+	//Access control, also used when a device is considered invalid
+	unsigned char bFlags;
+
+	unsigned short SampleIndex;
+	unsigned int Timestamp;
+
+	unsigned char PacketRate;
+
+	unsigned int SessionID;
+	unsigned int SessionVer;
+	char* SessionLoc;
+	unsigned short Size;
+	struct DEVICE* Device;
+
+	char ChannelOffset;	//First channel, eg 32. 32-64 if the stream defines 32 channels
+
+	unsigned char *SampleData;
+	unsigned short DataSize;
+
+};
+
+struct Ethernet
+{
+	unsigned char DestMAC[6];
+	unsigned char SrcMAC[6];
+	unsigned short Type;
+};
+
+struct IP4
+{
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+	unsigned char IHL : 4;
+	unsigned char Ver : 4;
+
+	unsigned char ECN : 2;
+	unsigned char DSCP : 6;
+
+	unsigned short Len;	//Still in big endian
+
+	unsigned short ID;
+
+	unsigned short Flags;
+
+#elif G_BYTE_ORDER == G_BIG_ENDIAN
+	unsigned char Ver : 4;
+	unsigned char IHL : 4;
+
+	unsigned char DSCP : 6;
+	unsigned char ECN : 2;
+
+	unsigned short Len;
+
+	unsigned short ID;
+
+	unsigned char Flags : 3;
+	unsigned short Frag : 13;
+
+
+#else
+#error "G_BYTE_ORDER should be big or little endian."
+#endif
+
+	unsigned char TimeToLive;
+	unsigned char Protocol;
+	unsigned short Checksum;
+	unsigned int SourceIP;
+	unsigned int DestIP;
+	
+};
+
+static_assert(sizeof(IP4) == 20, "");
+
+
+struct UDPHeader
+{
+	unsigned short SourcePort;			// Source port
+	unsigned short DestPort;			// Destination port
+	unsigned short Len;					// Datagram length
+	unsigned short CRC;					// Checksum
+};
+
+struct FRAME
+{
+	Ethernet Eth;
+	IP4 IPHdr;
+	UDPHeader UDP;
+	RTPHeader RTP;
+};
+
+struct PTPHeaderv1
+{
+	unsigned short	PVersion; //Transport Specific
+	unsigned short	NetVersion; //PTP version
+	char			SubDomain[16];
+	unsigned char	MsgType;
+	unsigned char	ComType;
+	unsigned char	UUIDMAC[6];
+	unsigned short	PortID;
+	unsigned short	SqID;
+	unsigned short	CtrlMsg;
+	unsigned short	Flags;
+	int				Padding;	//Don't use
+	unsigned int	Seconds;
+	unsigned int	NSeconds;
+	unsigned short	EpochNum;
+	unsigned short	UTCOffset;
+	unsigned char	Padding2;
+	unsigned char	MasterTech;
+	unsigned char	MasterMAC[6];
+	unsigned short	MasterPortID;
+	unsigned short	MasterSqID;
+	unsigned int	MasterStratum;
+	char			ClockID[4];
+	unsigned short	Padding4;
+	short			ClockVariance;
+	unsigned short	Preferred;
+	unsigned short	IsBoundaryClock;
+	unsigned char	Padding6[3];
+	signed char		SyncInterval;
+	unsigned short	Padding7;
+	short			LocalClockVariance;
+	unsigned short	Padding8;
+	unsigned short	LocalStepsRemoved;	//!Not important
+	unsigned int	LocalClockStratum;
+	unsigned char	LocalClockID[4];
+	unsigned short	ParentComID;
+	unsigned char	ParentUUIDMAC[6];
+	unsigned short	Padding9;
+	unsigned short	ParentPortField;
+	unsigned short  Padding10;
+	unsigned short	EstimatedMasterVariance;
+	unsigned int	EstimatedMasterDrift;
+	unsigned int	UTCReasonable;
+};
+
+struct PTPHeaderv2
+{
+
+	unsigned short	PTPVersion;	//0x2
+	
+	unsigned short	Len;
+	unsigned short	SubDomainNum;
+	unsigned short	Flags;
+
+	//Only for little endian!
+	unsigned long long CorrectionSubNS : 16;
+	unsigned long long CorrectionNS : 48;
+
+	int					Padding;
+
+	unsigned char		ClockID[8];
+	unsigned short		SourcePortID;
+	unsigned short		SqID;
+	unsigned char		Control;
+	unsigned char		LogMessagePeriod;
+
+	unsigned char		Seconds[6];
+	unsigned int		NanoSeconds;
+};
+
+
+//Streams can either be added or replaced (reconnect)
+//The only way to differentiate them is by their channel blocks.
+//We want an efficient way to check that. Using hashes isn't ideal because we can have anything from 1 to 128 channels from a single device and stream.
+//For now, we'll just use a byte array and test
+
+struct DEVICE
+{
+	char* DevName;
+	unsigned int IP;
+	unsigned char Channels;			//Number of channels streamed by this device
+	unsigned char ChannelOffset;	//Starting offset for device channels e.g Channeloffset = 32, Channels = 32 resulting in channels 32 to 64 in the absolute range. Relative ranges are held in the Streams
+};
+
+#ifdef WIN32
+#pragma pack(pop)
+#undef PACKED
+
+#else
+#undef PACKED
+#endif
+
+
+
+struct Interface
+{
+	char *Name;	//Hardware name
+	char* Description;	//Readable Name
+	unsigned int IP;	//Local interface IP
+	unsigned char MAC[16];
+	void* Handle;	//Internal
+};
+
+#define MAXSAMPLES 384 //Max number of total samples per packet @24 bits
+#define FRAMESIZE 54
+#define UDPPAYLOAD 42
+
+struct SAPConfig
+{
+	char* DeviceName;
+
+	unsigned char BitDepth;	//Lower or higher resolutions will automatically be rescaled
+
+	/* Transmission flow control */
+	unsigned char Channels;				//Total number of channels
+	unsigned char Samples;				//Per stream
+	unsigned char ChannelsPerStream;	//Number of channels per stream
+	unsigned short SampleRate;			//Should match receivers
+
+	/*
+		The number of Samples + Channels per stream will be 
+		limited to the packet size limit of about 1.2kb
+	*/
+
+
+	unsigned int MulticastIP;	/*Internal*/
+	unsigned int Port;			/*Internal*/
+	unsigned short StreamRate;	/*Internal*/
+};
+
+typedef void(*timer)(unsigned char Channels, unsigned short SendOffset);
+
+
+#define VALIDINTERFACE(x) x->Handle
+
+extern AOIP_API unsigned char DevIndex;
+extern AOIP_API DEVICE Devices[128];
+extern AOIP_API unsigned short ChannelCount;
+extern AOIP_API SDP TransmissionStreams[32];
+extern AOIP_API unsigned char NumTStreams;
+
+AOIP_API Interface* GetInterfaces();
+
+
+//
+//// Initializer functions, needs to be called in the order of declaration as seen below.
+//
+AOIP_API void InitializeIf(Interface*);
+AOIP_API void InitializeSAP(const char* IP);
+//It's crucial that the SampleDelay is some multiple of 16
+AOIP_API void InitializeEngine(double _IntervalFreq, timer _Callback, unsigned char SampleDelay, float *RecvBuffer /* at least 16*128*3 bytes in size */);
+AOIP_API void InitializePTP(const char* IP, unsigned int Port);
+
+AOIP_API void SetDeviceName(const char*);
+AOIP_API SDP* CreateNewStream(const char* StreamName, unsigned char ChannelOffset, unsigned char NumChannels, unsigned char NumSamples, unsigned int SampleRate);
+//
+//// Control flow functions
+//
+AOIP_API void BeginSAP();
+AOIP_API void EndSAP();
+AOIP_API void BeginSAPTransmission();
+AOIP_API void EndSAPTransmission();
+
+AOIP_API void BeginRTPRecv();
+AOIP_API void EndRTPRecv();
+
+AOIP_API void BeginRTPTransmission();
+AOIP_API void EndRTPTransmission();
+
+AOIP_API void ResumeRTPCallback();
+AOIP_API void PauseRTPCallback();
+
+AOIP_API void SetIPPrefix(unsigned char);

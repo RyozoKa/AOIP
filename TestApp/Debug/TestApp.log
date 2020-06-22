@@ -1,0 +1,18 @@
+﻿  TestApp.cpp
+c:\users\chris\source\repos\aoip\testapp\testapp.cpp(78): warning C4244: 'return': conversion from 'float' to 'unsigned int', possible loss of data
+c:\users\chris\source\repos\aoip\testapp\testapp.cpp(83): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+c:\users\chris\source\repos\aoip\testapp\testapp.cpp(144): warning C4244: 'initializing': conversion from 'double' to 'unsigned int', possible loss of data
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) struct Interface * __cdecl GetInterfaces(void)" (__imp_?GetInterfaces@@YAPAUInterface@@XZ) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl InitializeIf(struct Interface *)" (__imp_?InitializeIf@@YAXPAUInterface@@@Z) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl InitializeSAP(char const *)" (__imp_?InitializeSAP@@YAXPBD@Z) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl InitializeEngine(double,void (__cdecl*)(unsigned char,unsigned short),unsigned char,float *)" (__imp_?InitializeEngine@@YAXNP6AXEG@ZEPAM@Z) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl SetDeviceName(char const *)" (__imp_?SetDeviceName@@YAXPBD@Z) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl CreateNewStream(char const *,unsigned char,unsigned char,unsigned char,unsigned int)" (__imp_?CreateNewStream@@YAXPBDEEEI@Z) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl BeginSAP(void)" (__imp_?BeginSAP@@YAXXZ) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl BeginSAPTransmission(void)" (__imp_?BeginSAPTransmission@@YAXXZ) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) void __cdecl BeginRTPRecv(void)" (__imp_?BeginRTPRecv@@YAXXZ) referenced in function _main
+TestApp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) unsigned char * __cdecl GetTxBuffer(unsigned char)" (__imp_?GetTxBuffer@@YAPAEE@Z) referenced in function "void __cdecl Callback(unsigned char,unsigned short)" (?Callback@@YAXEG@Z)
+TestApp.obj : error LNK2001: unresolved external symbol "__declspec(dllimport) unsigned char DevIndex" (__imp_?DevIndex@@3EA)
+TestApp.obj : error LNK2001: unresolved external symbol "__declspec(dllimport) struct DEVICE * Devices" (__imp_?Devices@@3PAUDEVICE@@A)
+TestApp.obj : error LNK2001: unresolved external symbol "__declspec(dllimport) unsigned short ChannelCount" (__imp_?ChannelCount@@3GA)
+C:\Users\Chris\source\repos\AOIP\Debug\TestApp.exe : fatal error LNK1120: 13 unresolved externals

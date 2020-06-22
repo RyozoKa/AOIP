@@ -1,0 +1,5 @@
+﻿  TestApp.cpp
+C:\Users\admin\source\repos\AOIP\TestApp\TestApp.cpp(103,24): warning C4244:  'return': conversion from 'double' to 'float', possible loss of data
+  Generating code
+  Finished generating code
+  TestApp.vcxproj -> C:\Users\admin\source\repos\AOIP\Release\TestApp.exe

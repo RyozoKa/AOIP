@@ -1,0 +1,31 @@
+﻿  cl : Command line warning D9025 : overriding '/sdl' with '/GS-'
+  AOIP.cpp
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(55,22): warning C4200:  nonstandard extension used: zero-sized array in struct/union
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(55,22): message :  This member will be ignored by a defaulted constructor or copy/move assignment operator
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(613,32): warning C4244:  '=': conversion from '__int64' to 'unsigned short', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(650,33): warning C4244:  '=': conversion from '__int64' to 'unsigned char', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(659,27): warning C4244:  '=': conversion from '__int64' to 'unsigned int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(667,25): warning C4244:  '=': conversion from '__int64' to 'unsigned char', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(731,17): warning C4244:  'return': conversion from 'float' to 'int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(737,15): warning C4244:  'return': conversion from 'float' to 'int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1354,20): warning C4018:  '<': signed/unsigned mismatch
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1681,20): warning C4018:  '<': signed/unsigned mismatch
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1964,65): warning C4244:  '=': conversion from 'unsigned __int64' to 'double', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1970,17): warning C4244:  '=': conversion from 'double' to 'unsigned __int64', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2034,16): warning C4244:  'initializing': conversion from 'unsigned __int64' to 'double', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2213,71): warning C4244:  '=': conversion from 'unsigned __int64' to 'unsigned int', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1720,6): warning C4101:  'GetTimeStamp': unreferenced local variable
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2096,8): warning C4101:  'seldat': unreferenced local variable
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2287,10): warning C4244:  'argument': conversion from '_Ty' to 'unsigned char', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2287,10): warning C4244:         with
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2287,10): warning C4244:         [
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2287,10): warning C4244:             _Ty=unsigned short
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2287,10): warning C4244:         ]
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2438,12): warning C4244:  'initializing': conversion from 'unsigned __int64' to 'double', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2439,13): warning C4244:  'initializing': conversion from 'unsigned __int64' to 'double', possible loss of data
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(2445,14): warning C4244:  '=': conversion from 'unsigned __int64' to 'double', possible loss of data
+     Creating library C:\Users\admin\source\repos\AOIP\Release\AOIP.lib and object C:\Users\admin\source\repos\AOIP\Release\AOIP.exp
+  Generating code
+C:\Users\admin\source\repos\AOIP\AOIP\AOIP.cpp(1165): warning C4715: 'CharToNum': not all control paths return a value
+  Finished generating code
+  AOIP.vcxproj -> C:\Users\admin\source\repos\AOIP\Release\AOIP.dll

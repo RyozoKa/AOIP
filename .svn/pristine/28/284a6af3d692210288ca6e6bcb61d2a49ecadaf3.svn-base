@@ -1,0 +1,411 @@
+// TestApp.cpp : This file contains the 'main' function. Program execution begins and ends there.
+//
+ 
+#define _CRT_SECURE_NO_WARNINGS 1
+
+#include <iostream>
+#include "AOIP.h"
+#include <Windows.h>
+#include <mmsystem.h>
+#include <math.h>
+#include <signal.h>
+
+extern "C"
+NTSYSAPI
+NTSTATUS
+NTAPI
+NtDelayExecution(
+
+
+
+	IN BOOLEAN              Alertable,
+	IN PLARGE_INTEGER       DelayInterval);
+
+bool bSwitch = false;
+LARGE_INTEGER data;
+
+HWAVEOUT hWaveOut; /* device handle */
+WAVEFORMATEX wfx; /* look this up in your documentation */
+MMRESULT result;/* for waveOut return values */
+
+WAVEHDR header;
+
+unsigned char ChannelOff = 0;
+
+typedef struct {
+	char   chunk_id[4];        // RIFF string
+	unsigned int    chunk_size;         // overall size of file in bytes (36 + data_size)
+	char   sub_chunk1_id[8];   // WAVEfmt string with trailing null char
+	unsigned int    sub_chunk1_size;    // 16 for PCM.  This is the size of the rest of the Subchunk which follows this number.
+	unsigned short  audio_format;       // format type. 1-PCM, 3- IEEE float, 6 - 8bit A law, 7 - 8bit mu law
+	unsigned short  num_channels;       // Mono = 1, Stereo = 2
+	unsigned int    sample_rate;        // 8000, 16000, 44100, etc. (blocks per second)
+	unsigned int    byte_rate;          // SampleRate * NumChannels * BitsPerSample/8
+	unsigned short  block_align;        // NumChannels * BitsPerSample/8
+	unsigned short  bits_per_sample;    // bits per sample, 8- 8bits, 16- 16 bits etc
+	char   sub_chunk2_id[4];   // Contains the letters "data"
+	unsigned int    sub_chunk2_size;    // NumSamples * NumChannels * BitsPerSample/8 - size of the next chunk that will be read
+} wav_header_t;
+
+void get_wav_header(int raw_sz, wav_header_t *wh)
+{
+	// RIFF chunk
+	strcpy(wh->chunk_id, "RIFF");
+	wh->chunk_size = 36 + raw_sz;
+	// fmt sub-chunk (to be optimized)
+	strncpy(wh->sub_chunk1_id, "WAVEfmt ", strlen("WAVEfmt "));
+	wh->sub_chunk1_size = 16;
+	wh->audio_format = 3;
+	wh->num_channels = 2;
+	wh->sample_rate = 48000;
+	wh->bits_per_sample = 32;
+	wh->block_align = wh->num_channels * (wh->bits_per_sample / 8);
+	wh->byte_rate = wh->sample_rate * wh->num_channels * (wh->bits_per_sample / 8);
+
+	// data sub-chunk
+	strncpy(wh->sub_chunk2_id, "data", strlen("data"));
+	wh->sub_chunk2_size = raw_sz;
+}
+
+#define DATASIZE 1024 * 1024 * 10 + 32
+float OutData[2][480000];
+int Step = 0;
+__declspec(align(32)) float Buffer[128][48];
+unsigned int WritePos = 0;
+FILE* fd = fopen("./Test2.wav", "wb");
+
+static inline int ToInt(float x)
+{
+	//x += 1.f;
+	return ((int)(8388608.0 * (double)x));
+}
+
+static inline int ToInt16(float x)
+{
+	//x += 1.f;
+	return (int) (32767.f * x);
+}
+
+inline int interpret24bitAsInt32(const unsigned char* byteArray) {
+	return (
+		(byteArray[0] << 24)
+		| (byteArray[1] << 16)
+		| (byteArray[2] << 8)
+		) >> 8;
+}
+
+static inline float ToFloat(int Sample)
+{
+
+	//return ((long long)Sample - 8388608) * (1.0 / 8388608);
+//	DumpBytes((const unsigned char*)&Sample, 4);
+	//return (float)((double)Sample / 8388608.0);
+	return ((float)Sample * (1.0f / 8388608.0));
+	//return (((double)Sample) / 8388608.0) - 1.f;
+}
+
+
+unsigned long long F = 0;
+
+bool bUseSWave = false;
+
+bool bSound[128];
+float NullData[48] = { 0 };
+
+void Callback(unsigned char Channels)
+{
+	//Copy data for the first two channels
+	//memcpy(&OutData[WritePos], &(Buffer[0][ReadOffset]), 16 * sizeof(float));
+	//WritePos += 16;
+	//memcpy(&OutData[WritePos], &(Buffer[1][ReadOffset]), 16 * sizeof(float));
+	//WritePos += 16;
+/*	for (int i = 0; i < 16; ++i)
+	{
+		unsigned int A = ToInt(Buffer[0][i]);
+		OutData[WritePos++] = A & 0xFF;
+		OutData[WritePos++] = (A >> 8) & 0xFF;
+		OutData[WritePos++] = (A >> 16) & 0xFF;
+		A = ToInt(Buffer[1][i]);
+		OutData[WritePos++] = A & 0xFF;
+		OutData[WritePos++] = (A >> 8) & 0xFF;
+		OutData[WritePos++] = (A >> 16) & 0xFF;
+	}
+	
+	//printf("%08X %08X\n", ToInt(Buffer[0][ReadOffset]), ToInt(Buffer[1][ReadOffset]));
+	if (WritePos >= (DATASIZE))
+	{
+		try
+		{
+			printf("misalign? %u %u", sizeof(OutData), WritePos);
+			fwrite(OutData, 1, sizeof(OutData), fd);
+			printf("2");
+			fclose(fd);
+		}
+		catch (std::exception e)
+		{
+			printf("Error %s", e.what());
+		}
+		catch (...)
+		{
+			printf("Error %u", GetLastError());
+		}
+		printf("3");
+		exit(0);
+	}*/
+
+	/*
+						Dante stores the samples as Sample1 channel 1 - n, sample2 channel 1 - n...
+						We need to change that to channel 1: sample 1 - n, channel2 sample 1 - n...
+
+					*/
+	
+	//unsigned char LData[2048];
+#define E_PI 3.1415926535897932384626433832795028841971693993751058209749445923078164062f
+	//
+	for (int i = 0; i < 8; ++i)
+	{
+		unsigned char* LData = GetTxBuffer(i);
+	
+		const int ChLen = 8;
+		//F = 0;
+		for (unsigned int Sample = 0; Sample < 48; ++Sample)
+		{
+			//int Sam2 = ToInt(sin((2.f * float(E_PI) * 500) / 48000 * F) * 0.5);
+			for (unsigned int Ch = 0; Ch < (ChLen); ++Ch)
+			{
+			//	bSound[Ch + (i * 8)] = (memcmp(&Buffer[Ch + (i * 8)][0], NullData, 48 * 4) > 0);
+
+				int Sam = 0;
+				//if (bUseSWave)
+				//	Sam = Sam2;
+				//else
+					Sam = ToInt(Buffer[Ch + (i * 8)][Sample]);
+
+				LData[((Sample) * (ChLen * 3)) + ((Ch) * 3) + 2] = Sam & 0xFF;
+				LData[((Sample) * (ChLen * 3)) + ((Ch) * 3) + 1] = (Sam >> 8) & 0xFF;
+				LData[((Sample) * (ChLen * 3)) + ((Ch) * 3)] = (Sam >> 16) & 0xFF;
+				//OutData[Ch][Sample + Step] = Buffer[0][Sample];// Buffer[0][Sample];
+			}
+			//++F;
+			//if (F > 96)
+			//	F = 1;
+		}
+
+	}
+		
+	
+	//Step += 48;
+	//fwrite(TMP, 1, 288, fd);
+	/*if (memcmp(LData, BData + 12, (48 * 2) * 3) != 0)
+	{
+		printf("Error mismatch for %i!\n", pp);
+		DumpBytes(BData + 12, (48 * 2) * 3);
+		printf("---------- WITH ---------\n");
+		DumpBytes(LData, (48 * 2) * 3);
+		exit(1);
+	}*/
+	//DelayUS(600);
+	/*if (Step == 480000)
+	{
+	//	fwrite(OutData, 1, sizeof(OutData), fd);
+	//	fclose(fd);
+	//	exit(1);
+	}
+	ZeroMemory(Buffer, 128 * 48 * 4);*/
+}
+
+
+
+int main()
+{
+	data.QuadPart = -1;
+	
+	wav_header_t wheader;
+
+	if (!fd)
+	{
+		printf("Error fd null");
+		exit(0);
+	}
+	get_wav_header(DATASIZE, &wheader);
+	fwrite(&wheader, 1, sizeof(wav_header_t),  fd);
+	/*
+	 * first we need to set up the WAVEFORMATEX structure.
+	 * the structure describes the format of the audio.
+	 */
+//	wfx.nSamplesPerSec = 48000; /* sample rate */
+//	wfx.wBitsPerSample = 24; /* sample size */
+//	wfx.nChannels = 2; /* channels*/
+	/*
+	 * WAVEFORMATEX also has other fields which need filling.
+	 * as long as the three fields above are filled this should
+	 * work for any PCM (pulse code modulation) format.
+	 */
+//	wfx.cbSize = 0; /* size of _extra_ info */
+//	wfx.wFormatTag = WAVE_FORMAT_PCM;
+//	wfx.nBlockAlign = (wfx.wBitsPerSample >> 3) * wfx.nChannels;
+//	wfx.nAvgBytesPerSec = wfx.nBlockAlign * wfx.nSamplesPerSec;
+	/*
+	 * try to open the default wave device. WAVE_MAPPER is
+	 * a constant defined in mmsystem.h, it always points to the
+	 * default wave device on the system (some people have 2 or
+	 * more sound cards).
+	 */
+//	if (waveOutOpen(
+//		&hWaveOut,
+//		WAVE_MAPPER,
+//		&wfx,
+//		0,
+//		0,
+//		CALLBACK_NULL
+//	) != MMSYSERR_NOERROR) {
+//		fprintf(stderr, "unable to open WAVE_MAPPER device\n");
+//		ExitProcess(1);
+//	}
+
+	//StartTimer(&TimerTick, 1000);
+
+	//Test SAP/SDP decoder
+	//SDA test data
+	/*char data[] = 
+		"\x20\x00\xf8\x38\xc0\xa8\x0f\x61\x61\x70\x70\x6c\x69\x63\x61\x74" \
+		"\x69\x6f\x6e\x2f\x73\x64\x70\x00\x76\x3d\x30\x0d\x0a\x6f\x3d\x2d" \
+		"\x20\x34\x39\x36\x30\x33\x34\x20\x34\x39\x36\x30\x33\x34\x20\x49" \
+		"\x4e\x20\x49\x50\x34\x20\x31\x39\x32\x2e\x31\x36\x38\x2e\x31\x35" \
+		"\x2e\x39\x37\x0d\x0a\x73\x3d\x41\x56\x49\x4f\x55\x53\x42\x2d\x35" \
+		"\x30\x37\x33\x31\x62\x20\x3a\x20\x32\x0d\x0a\x63\x3d\x49\x4e\x20" \
+		"\x49\x50\x34\x20\x32\x33\x39\x2e\x36\x39\x2e\x31\x34\x39\x2e\x31" \
+		"\x33\x31\x2f\x33\x32\x0d\x0a\x74\x3d\x30\x20\x30\x0d\x0a\x61\x3d" \
+		"\x6b\x65\x79\x77\x64\x73\x3a\x44\x61\x6e\x74\x65\x0d\x0a\x6d\x3d" \
+		"\x61\x75\x64\x69\x6f\x20\x35\x30\x30\x34\x20\x52\x54\x50\x2f\x41" \
+		"\x56\x50\x20\x39\x37\x0d\x0a\x69\x3d\x32\x20\x63\x68\x61\x6e\x6e" \
+		"\x65\x6c\x73\x3a\x20\x4c\x65\x66\x74\x2c\x20\x52\x69\x67\x68\x74" \
+		"\x0d\x0a\x61\x3d\x72\x65\x63\x76\x6f\x6e\x6c\x79\x0d\x0a\x61\x3d" \
+		"\x72\x74\x70\x6d\x61\x70\x3a\x39\x37\x20\x4c\x32\x34\x2f\x34\x38" \
+		"\x30\x30\x30\x2f\x32\x0d\x0a\x61\x3d\x70\x74\x69\x6d\x65\x3a\x31" \
+		"\x0d\x0a\x61\x3d\x74\x73\x2d\x72\x65\x66\x63\x6c\x6b\x3a\x70\x74" \
+		"\x70\x3d\x49\x45\x45\x45\x31\x35\x38\x38\x2d\x32\x30\x30\x38\x3a" \
+		"\x30\x30\x2d\x30\x30\x2d\x30\x30\x2d\x46\x46\x2d\x46\x45\x2d\x30" \
+		"\x30\x2d\x30\x30\x2d\x30\x30\x3a\x30\x0d\x0a\x61\x3d\x6d\x65\x64" \
+		"\x69\x61\x63\x6c\x6b\x3a\x64\x69\x72\x65\x63\x74\x3d\x32\x39\x31" \
+		"\x39\x38\x34\x39\x38\x33\x0d\x0a\0";
+
+	SDP Test;
+	Test.PacketSize = 329;
+	//Test.SDPData = data + sizeof(SAP);	//SAP = 24 bytes
+	memcpy(Test.Raw, data, 330);	//Just temporary.. don't worry
+	volatile unsigned long long Start = __rdtsc();
+	DecodeSession(Test);
+	volatile unsigned long long Stop = __rdtsc() - Start;
+	printf("Ticks: %llu\n", Stop);*/
+	Interface* Interfaces = GetInterfaces();
+	int j = 0;
+	for (Interface* i = Interfaces; i->Handle; ++i)
+	{
+		printf("Interface: %u : (%s) %02X-%02X-%02X-%02X-%02X-%02X ",j++, i->Description, i->MAC[0], i->MAC[1], i->MAC[2], i->MAC[3], i->MAC[4], i->MAC[5] );
+		printf("\n");
+	}
+	printf("Select Interface\n");
+	std::cin >> j;
+
+	printf("Sinewave generator?");
+	std::cin >> bUseSWave;
+
+	InitializeIf(&Interfaces[j]);
+
+	//InitializePTP("224.0.1.129", 319);
+
+	SetDeviceName("Host");
+	CreateNewStream("Host Stream 2", 0, 8, 48, 48000, 1);
+	CreateNewStream("Host Stream 3", 8, 8, 48, 48000, 2);
+	CreateNewStream("Host Stream 4", 16, 8, 48, 48000, 3);
+	CreateNewStream("Host Stream 5", 24, 8, 48, 48000, 4);
+
+	CreateNewStream("Host Stream 6", 32, 8, 48, 48000, 5);
+	CreateNewStream("Host Stream 7", 40, 8, 48, 48000, 6);
+	CreateNewStream("Host Stream 8", 48, 8, 48, 48000, 7);
+	CreateNewStream("Host Stream 9", 56, 8, 48, 48000, 8);
+	
+
+	//Devices[0].DevName = (char*)"TIO2";
+	//Devices[0].ChannelOffset = 0;
+	//AddStream((char*)"Y001-Yamaha-Tio1608-D-0e0a12 : 32", 2);
+	//AddStream((char*)"AVIOUSB-50731b : 2", 0);
+	InitializeSAP("239.255.255.255");
+	
+	
+
+	//Sleep(30000);
+
+	
+	BeginSAP();
+	BeginSAPTransmission();
+
+	Sleep(30000);
+
+	for (unsigned char i = 0; i < Index; ++i)
+	{
+		if (!strcmp(Streams[i].DevName, "PCIe-08074e : 32"))
+			Streams[i].ChannelOffset = 0;
+		else if (!strcmp(Streams[i].DevName, "PCIe-08074e : 31"))
+			Streams[i].ChannelOffset = 8;
+		else if (!strcmp(Streams[i].DevName, "PCIe-08074e : 30"))
+			Streams[i].ChannelOffset = 16;
+		else if (!strcmp(Streams[i].DevName, "PCIe-08074e : 29"))
+			Streams[i].ChannelOffset = 24;
+		else if (!strcmp(Streams[i].DevName, "PCIe-08074e : 28"))
+			Streams[i].ChannelOffset = 32;
+		else if (!strcmp(Streams[i].DevName, "PCIe-08074e : 27"))
+			Streams[i].ChannelOffset = 40;
+		else if (!strcmp(Streams[i].DevName, "PCIe-08074e : 26"))
+			Streams[i].ChannelOffset = 48;
+		else if (!strcmp(Streams[i].DevName, "PCIe-08074e : 25"))
+			Streams[i].ChannelOffset = 56;
+		//else if (!strcmp(Streams[i].DevName, "AVIOUSB-50731b : 2"))
+		//	Streams[i].ChannelOffset = 0;
+		else
+			Streams[i].ChannelOffset = 96;
+		printf("Stream %s, Num Channels %u Channel offset %u\n", Streams[i].DevName, Streams[i].Channels, Streams[i].ChannelOffset);
+	}
+	
+	//for (unsigned char i = 0; i < DevIndex; ++i)
+	//{
+	//	if (!strncmp(Devices[i].DevName, "TIO2", 4))	// 0 - 8
+	//	{
+	//		Devices[i].ChannelOffset = 0;
+	//	}
+	//	else if (Devices[i].ChannelOffset == 0)
+	//		Devices[i].ChannelOffset = 96;
+	//	printf("Device %s, Num Channels %u Channel offset %u\n", Devices[i].DevName, Devices[i].Channels, Devices[i].ChannelOffset);
+	//}
+	
+	printf("%u channels total\n", ChannelCount.load());
+
+	
+
+	InitializeEngine(1000, &Callback, 0, (float*)&Buffer);
+	BeginRTPRecv();
+	while (true)
+	{
+		//printf("=================++++=========================");
+		//for (int i = 0; i < 64; ++i)
+		//{
+		//	printf("Ch %i: %i\n", i + 1, bSound[i]);
+		//}
+		Sleep(5000);
+	}
+	return 0;
+}
+
+
+
+// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
+// Debug program: F5 or Debug > Start Debugging menu
+
+// Tips for Getting Started: 
+//   1. Use the Solution Explorer window to add/manage files
+//   2. Use the Team Explorer window to connect to source control
+//   3. Use the Output window to see build output and other messages
+//   4. Use the Error List window to view errors
+//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
+//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
